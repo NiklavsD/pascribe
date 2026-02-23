@@ -63,7 +63,9 @@ log = logging.getLogger("pascribe")
 CONFIG_PATH = Path(__file__).parent / "config.json"
 DEFAULT_CONFIG = {
     "mic_device": None,
+    "mic_device_name": None,
     "system_device": None,
+    "system_device_name": None,
     "sample_rate": 16000,
     "buffer_minutes": 60,
     "whisper_model": "large-v3",
@@ -78,7 +80,7 @@ DEFAULT_CONFIG = {
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             cfg = json.load(f)
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
@@ -86,7 +88,7 @@ def load_config() -> dict:
     return DEFAULT_CONFIG.copy()
 
 def save_config(cfg: dict):
-    with open(CONFIG_PATH, "w") as f:
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
 config = load_config()
@@ -98,14 +100,14 @@ HISTORY_PATH = Path(__file__).parent / "history.json"
 def load_history() -> list:
     if HISTORY_PATH.exists():
         try:
-            with open(HISTORY_PATH) as f:
+            with open(HISTORY_PATH, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
             return []
     return []
 
 def save_history(history: list):
-    with open(HISTORY_PATH, "w") as f:
+    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
 
 def add_history_entry(minutes: int, word_count: int, elapsed: float, text: str):
@@ -148,6 +150,36 @@ def list_input_devices() -> list[tuple[int, str, int]]:
 
     return results
 
+def resolve_device(device_id: int | None, device_name: str | None) -> int | None:
+    """Resolve a device by name first (handles index changes across reboots),
+    falling back to stored index if the name isn't found."""
+    if device_id is None and device_name is None:
+        return None
+
+    devices = sd.query_devices()
+
+    # If we have a stored name, try to find it by name first
+    if device_name:
+        for i, d in enumerate(devices):
+            if d['max_input_channels'] > 0 and d['name'] == device_name:
+                if i != device_id:
+                    log.info(f"Device '{device_name}' moved: index {device_id} -> {i}")
+                return i
+
+    # Fall back to stored index, but validate it exists and is an input device
+    if device_id is not None:
+        try:
+            d = sd.query_devices(device_id)
+            if d['max_input_channels'] > 0:
+                return device_id
+        except Exception:
+            pass
+
+    if device_name:
+        log.warning(f"Device '{device_name}' (index {device_id}) not found")
+    return None
+
+
 def categorize_device(name: str) -> str:
     """Return category label for a device name."""
     nl = name.lower()
@@ -169,6 +201,7 @@ class AudioBuffer:
     max_chunks: int = 3600  # default 60min
     chunks: deque = field(default_factory=deque)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    capture_rate: int = 16000  # actual sample rate used for capture
 
     def add_chunk(self, data: np.ndarray):
         with self.lock:
@@ -217,51 +250,74 @@ def loopback_callback(indata, frames, time_info, status):
     mono = indata.mean(axis=1) if indata.ndim > 1 else indata.flatten()
     loopback_buffer.add_chunk(mono)
 
+def _open_stream(device_id: int, channels: int, callback, preferred_rate: int):
+    """Try to open an InputStream at preferred_rate, falling back to the device's default rate."""
+    dev_info = sd.query_devices(device_id)
+    rates_to_try = [preferred_rate]
+    default_rate = int(dev_info['default_samplerate'])
+    if default_rate != preferred_rate:
+        rates_to_try.append(default_rate)
+
+    last_err = None
+    for sr in rates_to_try:
+        try:
+            stream = sd.InputStream(
+                device=device_id,
+                samplerate=sr,
+                channels=channels,
+                dtype='float32',
+                blocksize=sr * CHUNK_SECONDS,
+                callback=callback,
+            )
+            stream.start()
+            return stream, sr
+        except Exception as e:
+            last_err = e
+            if sr == preferred_rate:
+                log.warning(f"Device {device_id} rejected {sr} Hz, trying {default_rate} Hz")
+    raise last_err
+
+
 def start_audio_streams():
     """Start mic and loopback audio capture streams."""
     streams = []
     sr = config["sample_rate"]
-    chunk_samples = sr * CHUNK_SECONDS
 
-    mic_dev = config["mic_device"]
+    mic_dev = resolve_device(config["mic_device"], config.get("mic_device_name"))
     if mic_dev is not None:
         try:
             dev_info = sd.query_devices(mic_dev)
-            mic_stream = sd.InputStream(
-                device=mic_dev,
-                samplerate=sr,
-                channels=1,
-                dtype='float32',
-                blocksize=chunk_samples,
-                callback=mic_callback,
-            )
-            mic_stream.start()
-            streams.append(mic_stream)
-            log.info(f"Mic: {dev_info['name']}")
+            stream, actual_rate = _open_stream(mic_dev, 1, mic_callback, sr)
+            mic_buffer.capture_rate = actual_rate
+            streams.append(stream)
+            log.info(f"Mic: {dev_info['name']} @ {actual_rate} Hz")
+            # Persist resolved index and name
+            config["mic_device"] = mic_dev
+            config["mic_device_name"] = dev_info['name']
         except Exception as e:
             log.error(f"Mic capture failed: {e}")
     else:
         log.info("Mic: skipped (none selected)")
 
-    sys_dev = config["system_device"]
+    sys_dev = resolve_device(config["system_device"], config.get("system_device_name"))
     if sys_dev is not None:
         try:
             dev_info = sd.query_devices(sys_dev)
-            sys_stream = sd.InputStream(
-                device=sys_dev,
-                samplerate=sr,
-                channels=min(2, dev_info['max_input_channels']),
-                dtype='float32',
-                blocksize=chunk_samples,
-                callback=loopback_callback,
-            )
-            sys_stream.start()
-            streams.append(sys_stream)
-            log.info(f"System audio: {dev_info['name']}")
+            channels = min(2, dev_info['max_input_channels'])
+            stream, actual_rate = _open_stream(sys_dev, channels, loopback_callback, sr)
+            loopback_buffer.capture_rate = actual_rate
+            streams.append(stream)
+            log.info(f"System audio: {dev_info['name']} @ {actual_rate} Hz")
+            # Persist resolved index and name
+            config["system_device"] = sys_dev
+            config["system_device_name"] = dev_info['name']
         except Exception as e:
             log.error(f"System audio capture failed: {e}")
     else:
         log.info("System audio: skipped (none selected)")
+
+    # Save back any resolved device changes
+    save_config(config)
 
     return streams
 
@@ -318,6 +374,17 @@ def transcribe_audio(
 
     return " ".join(text_parts)
 
+# ─── Resampling ──────────────────────────────────────────────────────────────
+
+def _resample(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """Resample audio from src_rate to dst_rate using linear interpolation."""
+    if src_rate == dst_rate:
+        return audio
+    ratio = dst_rate / src_rate
+    new_len = int(len(audio) * ratio)
+    indices = np.linspace(0, len(audio) - 1, new_len)
+    return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+
 # ─── Hotkey Handling ──────────────────────────────────────────────────────────
 
 def on_transcribe(minutes: int):
@@ -334,9 +401,16 @@ def on_transcribe(minutes: int):
     update_tray_icon("yellow")
     notify(f"Transcribing last {minutes} min...")
 
-    # Get audio from buffers
+    # Get audio from buffers and resample to 16 kHz for Whisper
+    whisper_rate = 16000
+
     mic_audio = mic_buffer.get_last_n_minutes(minutes)
+    if mic_audio is not None and mic_buffer.capture_rate != whisper_rate:
+        mic_audio = _resample(mic_audio, mic_buffer.capture_rate, whisper_rate)
+
     loopback_audio = loopback_buffer.get_last_n_minutes(minutes)
+    if loopback_audio is not None and loopback_buffer.capture_rate != whisper_rate:
+        loopback_audio = _resample(loopback_audio, loopback_buffer.capture_rate, whisper_rate)
 
     if mic_audio is None and loopback_audio is None:
         log.warning("No audio in buffer")
@@ -469,12 +543,14 @@ def open_settings():
             devices = list_input_devices()
             device_labels = ["(None)"]
             device_ids = [None]
+            device_names = [None]
 
             for dev_id, name, channels in devices:
                 cat = categorize_device(name)
                 label = f"[{cat}] {name}"
                 device_labels.append(label)
                 device_ids.append(dev_id)
+                device_names.append(name)
 
             def find_current_label(device_id):
                 if device_id is None:
@@ -523,17 +599,19 @@ def open_settings():
                 mic_label = mic_var.get()
                 sys_label = sys_var.get()
 
-                mic_idx = device_ids[device_labels.index(mic_label)]
-                sys_idx = device_ids[device_labels.index(sys_label)]
+                mic_i = device_labels.index(mic_label)
+                sys_i = device_labels.index(sys_label)
 
-                config["mic_device"] = mic_idx
-                config["system_device"] = sys_idx
+                config["mic_device"] = device_ids[mic_i]
+                config["mic_device_name"] = device_names[mic_i]
+                config["system_device"] = device_ids[sys_i]
+                config["system_device_name"] = device_names[sys_i]
                 save_config(config)
 
                 status_var.set(
                     "Saved. Restart Pascribe for device changes to take effect."
                 )
-                log.info(f"Settings saved: mic={mic_idx}, system={sys_idx}")
+                log.info(f"Settings saved: mic={device_ids[mic_i]}, system={device_ids[sys_i]}")
 
             btn_frame = ttk.Frame(frame)
             btn_frame.grid(row=4, column=0, sticky="e", pady=(5, 0))
