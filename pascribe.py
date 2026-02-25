@@ -347,14 +347,17 @@ def unload_whisper():
     global transcriber
     with _whisper_lock:
         transcriber = None
-    import gc
-    gc.collect()
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass  # native CUDA cleanup can segfault — don't let it kill us
     log.info("Whisper model unloaded")
 
 def transcribe_audio(
     audio: np.ndarray, cancel_event: threading.Event | None = None
-) -> str:
-    """Transcribe numpy audio array. Checks cancel_event between segments."""
+) -> list[tuple[float, float, str]]:
+    """Transcribe numpy audio array. Returns list of (start, end, text) tuples."""
     init_whisper()
 
     segments, info = transcriber.transcribe(
@@ -365,14 +368,37 @@ def transcribe_audio(
         vad_parameters=dict(min_silence_duration_ms=500),
     )
 
-    text_parts = []
+    result = []
     for segment in segments:
         if cancel_event and cancel_event.is_set():
             log.info("Transcription cancelled")
-            return ""
-        text_parts.append(segment.text.strip())
+            return []
+        text = segment.text.strip()
+        if text:
+            result.append((segment.start, segment.end, text))
 
-    return " ".join(text_parts)
+    return result
+
+
+def format_ssmd(segments: list[tuple[float, float, str]], pause_threshold: float = 2.0) -> str:
+    """Format transcription segments as timestamped text with paragraph breaks on pauses."""
+    if not segments:
+        return ""
+
+    lines = []
+    prev_end = None
+
+    for start, end, text in segments:
+        # Insert paragraph break on significant pause
+        if prev_end is not None and (start - prev_end) > pause_threshold:
+            lines.append("")
+
+        mins = int(start) // 60
+        secs = int(start) % 60
+        lines.append(f"[{mins:02d}:{secs:02d}] {text}")
+        prev_end = end
+
+    return "\n".join(lines)
 
 # ─── Resampling ──────────────────────────────────────────────────────────────
 
@@ -389,6 +415,19 @@ def _resample(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
 
 def on_transcribe(minutes: int):
     """Handle hotkey press: cancel previous, grab audio, transcribe, clipboard."""
+    global last_transcript, _current_cancel
+
+    try:
+        _on_transcribe_inner(minutes)
+    except Exception as e:
+        log.error(f"Unhandled transcription thread error: {e}")
+        try:
+            update_tray_icon("red")
+            threading.Timer(3, lambda: update_tray_icon("green")).start()
+        except Exception:
+            pass
+
+def _on_transcribe_inner(minutes: int):
     global last_transcript, _current_cancel
 
     # Cancel any in-progress transcription and create a fresh event
@@ -435,7 +474,7 @@ def on_transcribe(minutes: int):
 
     try:
         start = time.time()
-        transcript = transcribe_audio(mixed, cancel_event=cancel)
+        segments = transcribe_audio(mixed, cancel_event=cancel)
         elapsed = time.time() - start
 
         # If cancelled during transcription, discard silently
@@ -443,10 +482,11 @@ def on_transcribe(minutes: int):
             log.info("Transcription was cancelled, discarding result")
             return
 
-        if transcript.strip():
+        if segments:
+            transcript = format_ssmd(segments)
             pyperclip.copy(transcript)
             last_transcript = transcript[:200]
-            word_count = len(transcript.split())
+            word_count = sum(len(t.split()) for _, _, t in segments)
             log.info(f"{word_count} words in {elapsed:.1f}s -> clipboard")
             update_tray_icon("green")
             notify(f"{word_count} words in {elapsed:.1f}s")
@@ -463,7 +503,10 @@ def on_transcribe(minutes: int):
         notify(f"Error: {e}")
         threading.Timer(3, lambda: update_tray_icon("green")).start()
     finally:
-        unload_whisper()
+        try:
+            unload_whisper()
+        except Exception as e:
+            log.error(f"Error unloading Whisper: {e}")
 
 def register_hotkeys():
     """Register hotkeys from config."""
