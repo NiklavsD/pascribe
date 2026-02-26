@@ -74,7 +74,7 @@ DEFAULT_CONFIG = {
         "1": 10, "2": 20, "3": 30, "4": 40, "5": 50, "6": 60,
         "7": 5, "8": 3, "9": 1,
     },
-    "hotkey_prefix": "right shift",
+    "hotkey_prefix": "ctrl+alt",
     "history_max_entries": 100,
 }
 
@@ -235,6 +235,9 @@ _current_cancel = threading.Event()
 _cancel_lock = threading.Lock()
 _settings_window_open = False
 _history_window_open = False
+_paused = False
+_transcribing = False
+_transcribing_lock = threading.Lock()
 
 # ─── Audio Capture ────────────────────────────────────────────────────────────
 
@@ -323,6 +326,32 @@ def start_audio_streams():
 
 # ─── Transcription ────────────────────────────────────────────────────────────
 
+WHISPER_VRAM_MB = {
+    "tiny": 400, "base": 500, "small": 1000, "medium": 2000,
+    "large-v1": 3200, "large-v2": 3200, "large-v3": 3200,
+}
+VRAM_SAFETY_MARGIN_MB = 512
+
+def _check_vram(model_name: str) -> tuple[bool, str]:
+    """Check if enough VRAM is available to load the model. Returns (ok, reason)."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return True, ""  # CPU mode, no VRAM concern
+        free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+        needed_mb = WHISPER_VRAM_MB.get(model_name, 3200) + VRAM_SAFETY_MARGIN_MB
+        if free_mb < needed_mb:
+            return False, (
+                f"Not enough VRAM: {free_mb:.0f} MB free, "
+                f"~{needed_mb:.0f} MB needed for {model_name}"
+            )
+        return True, ""
+    except ImportError:
+        return True, ""  # No torch = likely CPU mode
+    except Exception as e:
+        log.warning(f"VRAM check failed: {e}")
+        return True, ""  # Don't block on check failure
+
 def init_whisper():
     """Initialize faster-whisper model (lazy load on first use)."""
     global transcriber
@@ -333,6 +362,11 @@ def init_whisper():
             return
         model = config["whisper_model"]
         device = config["whisper_device"]
+        if device == "cuda":
+            ok, reason = _check_vram(model)
+            if not ok:
+                log.warning(f"Skipping model load: {reason}")
+                raise RuntimeError(reason)
         log.info(f"Loading Whisper {model} on {device}...")
         from faster_whisper import WhisperModel
         transcriber = WhisperModel(
@@ -353,6 +387,12 @@ def unload_whisper():
     except Exception:
         pass  # native CUDA cleanup can segfault — don't let it kill us
     log.info("Whisper model unloaded")
+
+WHISPER_HALLUCINATIONS = {
+    "thank you", "thanks for watching", "thanks for listening",
+    "subscribe", "like and subscribe", "bye", "goodbye",
+    "the end", "you", "thanks",
+}
 
 def transcribe_audio(
     audio: np.ndarray, cancel_event: threading.Event | None = None
@@ -376,6 +416,15 @@ def transcribe_audio(
         text = segment.text.strip()
         if text:
             result.append((segment.start, segment.end, text))
+
+    # Filter hallucinations: if the entire transcription is just a known
+    # hallucination phrase, discard it
+    if result:
+        all_text = " ".join(t for _, _, t in result).strip().lower()
+        all_text = all_text.strip(".,!?")
+        if all_text in WHISPER_HALLUCINATIONS:
+            log.info(f"Filtered hallucination: '{all_text}'")
+            return []
 
     return result
 
@@ -415,7 +464,16 @@ def _resample(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
 
 def on_transcribe(minutes: int):
     """Handle hotkey press: cancel previous, grab audio, transcribe, clipboard."""
-    global last_transcript, _current_cancel
+    global last_transcript, _current_cancel, _transcribing
+
+    if _paused:
+        return
+
+    # Prevent overlapping transcriptions — only one at a time
+    with _transcribing_lock:
+        if _transcribing:
+            log.info("Transcription already in progress, cancelling previous")
+        _transcribing = True
 
     try:
         _on_transcribe_inner(minutes)
@@ -426,6 +484,9 @@ def on_transcribe(minutes: int):
             threading.Timer(3, lambda: update_tray_icon("green")).start()
         except Exception:
             pass
+    finally:
+        with _transcribing_lock:
+            _transcribing = False
 
 def _on_transcribe_inner(minutes: int):
     global last_transcript, _current_cancel
@@ -827,6 +888,18 @@ def set_startup(enabled: bool):
 def on_startup_toggle(icon, item):
     set_startup(not is_startup_enabled())
 
+def on_pause_toggle(icon, item):
+    global _paused
+    _paused = not _paused
+    if _paused:
+        update_tray_icon("gray")
+        notify("Paused — hotkeys disabled")
+        log.info("Hotkeys paused by user")
+    else:
+        update_tray_icon("green")
+        notify("Resumed — hotkeys active")
+        log.info("Hotkeys resumed by user")
+
 # ─── Tray Setup ──────────────────────────────────────────────────────────────
 
 def on_quit(icon, item):
@@ -867,6 +940,11 @@ def setup_tray():
         MenuItem("Settings...", lambda icon, item: open_settings()),
         MenuItem("Transcription History...", lambda icon, item: open_history()),
         Menu.SEPARATOR,
+        MenuItem(
+            "Pause hotkeys",
+            on_pause_toggle,
+            checked=lambda item: _paused,
+        ),
         MenuItem(
             "Run on startup",
             on_startup_toggle,
