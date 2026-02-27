@@ -7,12 +7,16 @@ import threading
 import time
 import sys
 import os
+import io
 import json
+import wave
 import logging
 import subprocess
+import urllib.request
+import urllib.error
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -76,6 +80,12 @@ DEFAULT_CONFIG = {
     },
     "hotkey_prefix": "ctrl+alt",
     "history_max_entries": 100,
+    # Daily recording
+    "daily_recording": False,
+    "recording_path": "recordings",
+    "assemblyai_key": "",
+    "homelab_url": None,
+    "delete_after_transcribe": False,
 }
 
 def load_config() -> dict:
@@ -238,6 +248,7 @@ _history_window_open = False
 _paused = False
 _transcribing = False
 _transcribing_lock = threading.Lock()
+daily_recorder = None
 
 # ─── Audio Capture ────────────────────────────────────────────────────────────
 
@@ -246,12 +257,16 @@ def mic_callback(indata, frames, time_info, status):
         log.warning(f"Mic status: {status}")
     mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
     mic_buffer.add_chunk(mono)
+    if daily_recorder:
+        daily_recorder.write_mic(mono, mic_buffer.capture_rate)
 
 def loopback_callback(indata, frames, time_info, status):
     if status:
         log.warning(f"Loopback status: {status}")
     mono = indata.mean(axis=1) if indata.ndim > 1 else indata.flatten()
     loopback_buffer.add_chunk(mono)
+    if daily_recorder:
+        daily_recorder.write_sys(mono, loopback_buffer.capture_rate)
 
 def _open_stream(device_id: int, channels: int, callback, preferred_rate: int):
     """Try to open an InputStream at preferred_rate, falling back to the device's default rate."""
@@ -283,6 +298,7 @@ def _open_stream(device_id: int, channels: int, callback, preferred_rate: int):
 
 def start_audio_streams():
     """Start mic and loopback audio capture streams."""
+    global daily_recorder
     streams = []
     sr = config["sample_rate"]
 
@@ -321,6 +337,10 @@ def start_audio_streams():
 
     # Save back any resolved device changes
     save_config(config)
+
+    if config.get("daily_recording"):
+        daily_recorder = DailyAudioRecorder(config.get("recording_path", "recordings"))
+        log.info(f"Daily recording → {config.get('recording_path', 'recordings')}/")
 
     return streams
 
@@ -459,6 +479,440 @@ def _resample(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     new_len = int(len(audio) * ratio)
     indices = np.linspace(0, len(audio) - 1, new_len)
     return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+
+# ─── Daily Audio Recording ────────────────────────────────────────────────────
+
+class DailyAudioRecorder:
+    """Writes continuous audio to daily raw PCM files at 16 kHz.
+
+    Stores mic and system as separate streams (mic.raw / sys.raw) under
+    recordings/YYYY-MM-DD/. A meta.json records the session start time
+    and sample rate so timestamps can be reconstructed later.
+    """
+
+    STORE_RATE = 16000
+
+    def __init__(self, recording_path: str):
+        self.recording_path = Path(recording_path)
+        self._lock = threading.Lock()
+        self._mic_fh = None
+        self._sys_fh = None
+        self._current_date: str | None = None
+
+    def write_mic(self, data: np.ndarray, capture_rate: int):
+        self._write("mic", data, capture_rate)
+
+    def write_sys(self, data: np.ndarray, capture_rate: int):
+        self._write("sys", data, capture_rate)
+
+    def _write(self, stream: str, data: np.ndarray, capture_rate: int):
+        today = date.today().isoformat()
+        if capture_rate != self.STORE_RATE:
+            data = _resample(data, capture_rate, self.STORE_RATE)
+        with self._lock:
+            if today != self._current_date:
+                self._rotate(today)
+            fh = self._mic_fh if stream == "mic" else self._sys_fh
+            if fh:
+                fh.write(data.astype(np.float32).tobytes())
+
+    def _rotate(self, today: str):
+        self._close()
+        self._current_date = today
+        day_dir = self.recording_path / today
+        day_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_path = day_dir / "meta.json"
+        if not meta_path.exists():
+            meta = {"started": datetime.now().isoformat(), "sample_rate": self.STORE_RATE}
+            with open(meta_path, "w") as f:
+                json.dump(meta, f)
+            log.info(f"Daily recording started: {day_dir}")
+        else:
+            log.info(f"Daily recording resumed: {day_dir}")
+
+        self._mic_fh = open(day_dir / "mic.raw", "ab")
+        self._sys_fh = open(day_dir / "sys.raw", "ab")
+
+    def _close(self):
+        for fh in (self._mic_fh, self._sys_fh):
+            if fh:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+        self._mic_fh = None
+        self._sys_fh = None
+
+    def close(self):
+        with self._lock:
+            self._close()
+
+
+def load_todays_recordings() -> tuple[np.ndarray | None, np.ndarray | None, datetime | None, int]:
+    """Load today's mic and system audio from disk.
+    Returns (mic_audio, sys_audio, start_time, sample_rate).
+    """
+    rec_path = Path(config.get("recording_path", "recordings"))
+    today = date.today().isoformat()
+    day_dir = rec_path / today
+
+    if not day_dir.exists():
+        return None, None, None, 16000
+
+    meta_path = day_dir / "meta.json"
+    if not meta_path.exists():
+        return None, None, None, 16000
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    sample_rate = meta.get("sample_rate", 16000)
+    started = datetime.fromisoformat(meta["started"])
+
+    def load_raw(name: str) -> np.ndarray | None:
+        p = day_dir / name
+        if not p.exists() or p.stat().st_size == 0:
+            return None
+        return np.frombuffer(p.read_bytes(), dtype=np.float32).copy()
+
+    return load_raw("mic.raw"), load_raw("sys.raw"), started, sample_rate
+
+
+def _energy_vad(audio: np.ndarray, sample_rate: int,
+                frame_ms: int = 30,
+                min_speech_s: float = 0.4,
+                pad_s: float = 0.3) -> list[tuple[float, float]]:
+    """Energy-based VAD. Returns list of (start_s, end_s) speech segments.
+
+    Uses an adaptive threshold (fraction of top-energy frames) so it works
+    across quiet and loud environments without manual tuning.
+    """
+    frame_samples = int(sample_rate * frame_ms / 1000)
+    if len(audio) < frame_samples:
+        return []
+
+    n_frames = len(audio) // frame_samples
+    frames_rms = np.array([
+        np.sqrt(np.mean(audio[i * frame_samples:(i + 1) * frame_samples] ** 2))
+        for i in range(n_frames)
+    ])
+
+    if frames_rms.max() == 0:
+        return []
+
+    # Adaptive: threshold is 15% of the median of the loudest 20% of frames,
+    # floored at a tiny noise floor so silence-only recordings don't hallucinate speech.
+    top_20 = np.sort(frames_rms)[int(n_frames * 0.8):]
+    threshold = max(np.median(top_20) * 0.15, 1e-4)
+
+    is_speech = frames_rms > threshold
+
+    # Fill short gaps (< 500 ms) so words don't get split
+    gap_fill = int(500 / frame_ms)
+    for i in range(len(is_speech) - gap_fill):
+        if is_speech[i] and is_speech[i + gap_fill]:
+            is_speech[i:i + gap_fill] = True
+
+    # Extract contiguous regions, add padding
+    pad_frames = int(pad_s * 1000 / frame_ms)
+    segments: list[list[float]] = []
+    in_speech = False
+    seg_start = 0
+
+    for i, speech in enumerate(is_speech):
+        if speech and not in_speech:
+            seg_start = max(0, i - pad_frames)
+            in_speech = True
+        elif not speech and in_speech:
+            seg_end = min(n_frames - 1, i + pad_frames)
+            dur = (seg_end - seg_start) * frame_ms / 1000
+            if dur >= min_speech_s:
+                segments.append([seg_start * frame_ms / 1000, seg_end * frame_ms / 1000])
+            in_speech = False
+
+    if in_speech:
+        seg_end = n_frames - 1
+        dur = (seg_end - seg_start) * frame_ms / 1000
+        if dur >= min_speech_s:
+            segments.append([seg_start * frame_ms / 1000, seg_end * frame_ms / 1000])
+
+    # Merge overlapping segments
+    merged: list[list[float]] = []
+    for seg in segments:
+        if merged and seg[0] <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], seg[1])
+        else:
+            merged.append(seg)
+
+    max_s = len(audio) / sample_rate
+    return [(float(s[0]), float(min(s[1], max_s))) for s in merged]
+
+
+def _build_segment_map(vad_segs: list[tuple[float, float]]) -> list[tuple[float, float, float]]:
+    """Build a map from stripped-audio time → original-audio time.
+    Returns list of (stripped_start, stripped_end, orig_start).
+    """
+    seg_map = []
+    t = 0.0
+    for orig_start, orig_end in vad_segs:
+        dur = orig_end - orig_start
+        seg_map.append((t, t + dur, orig_start))
+        t += dur
+    return seg_map
+
+
+def _remap_to_original(t: float, seg_map: list[tuple[float, float, float]]) -> float:
+    """Convert a stripped-audio timestamp back to original-audio timestamp."""
+    for strip_start, strip_end, orig_start in seg_map:
+        if strip_start <= t <= strip_end:
+            return orig_start + (t - strip_start)
+    return t
+
+
+def _assign_speaker(start_s: float, end_s: float,
+                    mic_audio: np.ndarray, sys_audio: np.ndarray,
+                    sample_rate: int) -> str:
+    """Determine speaker by comparing RMS energy in mic vs system streams."""
+    s = int(start_s * sample_rate)
+    e = int(end_s * sample_rate)
+    mic_rms = float(np.sqrt(np.mean(mic_audio[s:min(e, len(mic_audio))] ** 2))) if s < len(mic_audio) else 0.0
+    sys_rms = float(np.sqrt(np.mean(sys_audio[s:min(e, len(sys_audio))] ** 2))) if s < len(sys_audio) else 0.0
+    return "you" if mic_rms >= sys_rms else "discord"
+
+# ─── AssemblyAI ───────────────────────────────────────────────────────────────
+
+ASSEMBLYAI_BASE = "https://api.assemblyai.com/v2"
+
+
+def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
+    """Convert float32 numpy audio to WAV bytes (16-bit PCM)."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes((audio * 32767).clip(-32768, 32767).astype(np.int16).tobytes())
+    return buf.getvalue()
+
+
+def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict]:
+    """Upload VAD-stripped audio to AssemblyAI, poll until done, return segments.
+    Each segment: {start_s, end_s, text}.
+    """
+    api_key = config.get("assemblyai_key", "")
+    if not api_key:
+        raise RuntimeError("assemblyai_key not configured in config.json")
+
+    wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
+    log.info(f"Uploading {len(wav_bytes) / 1024 / 1024:.1f} MB to AssemblyAI...")
+
+    hdrs_json = {"authorization": api_key, "content-type": "application/json"}
+    hdrs_bin  = {"authorization": api_key, "content-type": "application/octet-stream"}
+
+    # 1. Upload
+    req = urllib.request.Request(
+        f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes, headers=hdrs_bin, method="POST"
+    )
+    with urllib.request.urlopen(req) as r:
+        upload_url = json.loads(r.read())["upload_url"]
+
+    # 2. Submit transcription job
+    body = json.dumps({"audio_url": upload_url, "language_detection": True}).encode()
+    req = urllib.request.Request(
+        f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
+    )
+    with urllib.request.urlopen(req) as r:
+        transcript_id = json.loads(r.read())["id"]
+    log.info(f"AssemblyAI job: {transcript_id}")
+
+    # 3. Poll
+    poll_url = f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}"
+    while True:
+        req = urllib.request.Request(poll_url, headers={"authorization": api_key})
+        with urllib.request.urlopen(req) as r:
+            result = json.loads(r.read())
+        status = result["status"]
+        if status == "completed":
+            break
+        elif status == "error":
+            raise RuntimeError(f"AssemblyAI error: {result.get('error', 'unknown')}")
+        log.info(f"AssemblyAI: {status}...")
+        time.sleep(5)
+
+    # 4. Group words into utterances by pause threshold
+    words = result.get("words", [])
+    if not words:
+        return []
+
+    PAUSE_MS = 1200
+    segments: list[dict] = []
+    buf: list[str] = []
+    seg_start_s = words[0]["start"] / 1000.0
+
+    for i, w in enumerate(words):
+        buf.append(w["text"])
+        is_last = i == len(words) - 1
+        gap = 0 if is_last else words[i + 1]["start"] - w["end"]
+        if is_last or gap > PAUSE_MS:
+            segments.append({
+                "start_s": seg_start_s,
+                "end_s": w["end"] / 1000.0,
+                "text": " ".join(buf),
+            })
+            buf = []
+            if not is_last:
+                seg_start_s = words[i + 1]["start"] / 1000.0
+
+    return segments
+
+
+def post_to_homelab(data: dict, url: str):
+    """POST transcript JSON to homelab server."""
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, headers={"content-type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        log.info(f"Homelab response: {r.status}")
+
+# ─── Daily Transcription ──────────────────────────────────────────────────────
+
+def run_daily_transcription():
+    """Trigger daily transcription in a background thread (called from tray)."""
+    threading.Thread(target=_daily_transcription_worker, daemon=True).start()
+
+
+def _daily_transcription_worker():
+    try:
+        update_tray_icon("yellow")
+        notify("Loading today's recordings...")
+
+        mic_audio, sys_audio, started, sample_rate = load_todays_recordings()
+
+        if mic_audio is None and sys_audio is None:
+            notify("No recordings found — enable Daily Recording in Settings")
+            update_tray_icon("green")
+            return
+
+        has_both = mic_audio is not None and sys_audio is not None
+
+        if has_both:
+            min_len = min(len(mic_audio), len(sys_audio))
+            mix = mic_audio[:min_len] * 0.5 + sys_audio[:min_len] * 0.5
+        else:
+            mix = mic_audio if mic_audio is not None else sys_audio
+
+        duration_s = len(mix) / sample_rate
+        log.info(f"Daily audio: {duration_s / 3600:.1f}h from {started.strftime('%H:%M')}")
+
+        # VAD pre-strip to cut API costs
+        notify("VAD pre-processing...")
+        vad_segs = _energy_vad(mix, sample_rate)
+
+        if not vad_segs:
+            notify("No speech detected in today's recordings")
+            update_tray_icon("green")
+            return
+
+        total_speech_s = sum(e - s for s, e in vad_segs)
+        pct = 100 * total_speech_s / duration_s if duration_s > 0 else 0
+        log.info(
+            f"VAD: {total_speech_s / 60:.1f} min speech / "
+            f"{duration_s / 60:.1f} min total ({pct:.0f}%)"
+        )
+
+        # Build stripped audio + segment map for timestamp remapping
+        chunks = [mix[int(s * sample_rate):int(e * sample_rate)] for s, e in vad_segs]
+        stripped = np.concatenate(chunks)
+        peak = np.abs(stripped).max()
+        if peak > 0:
+            stripped = stripped / peak * 0.95
+        seg_map = _build_segment_map(vad_segs)
+
+        # Transcribe via AssemblyAI (or fall back to local GPU)
+        api_key = config.get("assemblyai_key", "")
+        if api_key:
+            notify(f"Transcribing {total_speech_s / 60:.0f} min via AssemblyAI...")
+            raw_segs = transcribe_with_assemblyai(stripped, sample_rate)
+        else:
+            notify(f"No API key — using local GPU ({total_speech_s / 60:.0f} min)...")
+            local = transcribe_audio(stripped)
+            raw_segs = [{"start_s": s, "end_s": e, "text": t} for s, e, t in local]
+
+        if not raw_segs:
+            notify("No speech transcribed")
+            update_tray_icon("green")
+            return
+
+        # Remap timestamps from stripped audio back to original audio time
+        for seg in raw_segs:
+            seg["start_s"] = _remap_to_original(seg["start_s"], seg_map)
+            seg["end_s"]   = _remap_to_original(seg["end_s"],   seg_map)
+
+        # Assign speaker labels using per-segment energy comparison
+        for seg in raw_segs:
+            if has_both:
+                seg["speaker"] = _assign_speaker(
+                    seg["start_s"], seg["end_s"], mic_audio, sys_audio, sample_rate
+                )
+            else:
+                seg["speaker"] = "you" if sys_audio is None else "discord"
+
+        # Add wall-clock timestamps
+        for seg in raw_segs:
+            wall = started + timedelta(seconds=seg["start_s"])
+            seg["wall_time"] = wall.strftime("%H:%M:%S")
+
+        word_count = sum(len(s["text"].split()) for s in raw_segs)
+        log.info(f"Daily transcript: {word_count} words, {len(raw_segs)} segments")
+
+        payload = {
+            "date": date.today().isoformat(),
+            "recorded_from": started.isoformat(),
+            "duration_minutes": round(duration_s / 60, 1),
+            "speech_minutes": round(total_speech_s / 60, 1),
+            "word_count": word_count,
+            "segments": [
+                {"time": s["wall_time"], "speaker": s["speaker"], "text": s["text"]}
+                for s in raw_segs
+            ],
+        }
+
+        # Save local copy alongside the raw audio
+        rec_path = Path(config.get("recording_path", "recordings"))
+        day_dir = rec_path / date.today().isoformat()
+        out_path = day_dir / "transcript.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        log.info(f"Transcript saved: {out_path}")
+
+        # POST to homelab if configured
+        homelab_url = config.get("homelab_url")
+        if homelab_url:
+            notify("Sending to homelab...")
+            try:
+                post_to_homelab(payload, homelab_url)
+            except Exception as e:
+                log.error(f"Homelab POST failed: {e}")
+                notify(f"Homelab error: {e}")
+
+        # Optionally delete raw audio after successful transcription
+        if config.get("delete_after_transcribe"):
+            for name in ("mic.raw", "sys.raw"):
+                p = day_dir / name
+                if p.exists():
+                    p.unlink()
+            log.info("Raw audio deleted after transcription")
+
+        notify(f"Done — {word_count} words, {total_speech_s / 60:.0f} min of speech")
+        update_tray_icon("green")
+
+    except Exception as e:
+        log.error(f"Daily transcription failed: {e}", exc_info=True)
+        notify(f"Daily transcription failed: {e}")
+        update_tray_icon("red")
+        threading.Timer(3, lambda: update_tray_icon("green")).start()
 
 # ─── Hotkey Handling ──────────────────────────────────────────────────────────
 
@@ -602,7 +1056,7 @@ def create_tray_image(color="green"):
     return img
 
 def update_tray_icon(color: str):
-    """Change the tray icon color (green/yellow/red)."""
+    """Change the tray icon color (green/yellow/red/gray)."""
     if tray_icon:
         tray_icon.icon = create_tray_image(color)
 
@@ -694,10 +1148,17 @@ def open_settings():
             )
             sys_combo.grid(row=3, column=0, sticky="ew", pady=(0, 15))
 
+            # Daily recording toggle
+            daily_var = tk.BooleanVar(value=config.get("daily_recording", False))
+            ttk.Checkbutton(
+                frame, text="Enable daily recording (saves audio to disk for end-of-day transcription)",
+                variable=daily_var
+            ).grid(row=4, column=0, sticky="w", pady=(0, 10))
+
             # Status label
             status_var = tk.StringVar(value="")
             status_label = ttk.Label(frame, textvariable=status_var, foreground="gray")
-            status_label.grid(row=5, column=0, sticky="w", pady=(10, 0))
+            status_label.grid(row=6, column=0, sticky="w", pady=(10, 0))
 
             def on_save():
                 mic_label = mic_var.get()
@@ -710,15 +1171,17 @@ def open_settings():
                 config["mic_device_name"] = device_names[mic_i]
                 config["system_device"] = device_ids[sys_i]
                 config["system_device_name"] = device_names[sys_i]
+                config["daily_recording"] = daily_var.get()
                 save_config(config)
 
                 status_var.set(
                     "Saved. Restart Pascribe for device changes to take effect."
                 )
-                log.info(f"Settings saved: mic={device_ids[mic_i]}, system={device_ids[sys_i]}")
+                log.info(f"Settings saved: mic={device_ids[mic_i]}, system={device_ids[sys_i]}, "
+                         f"daily_recording={daily_var.get()}")
 
             btn_frame = ttk.Frame(frame)
-            btn_frame.grid(row=4, column=0, sticky="e", pady=(5, 0))
+            btn_frame.grid(row=5, column=0, sticky="e", pady=(5, 0))
             ttk.Button(btn_frame, text="Save", command=on_save).pack(
                 side="right", padx=(5, 0)
             )
@@ -903,11 +1366,13 @@ def on_pause_toggle(icon, item):
 # ─── Tray Setup ──────────────────────────────────────────────────────────────
 
 def on_quit(icon, item):
+    if daily_recorder:
+        daily_recorder.close()
     icon.stop()
     os._exit(0)
 
 def _format_prefix(prefix: str) -> str:
-    """Abbreviate hotkey prefix for display: 'right shift' -> 'RShift'."""
+    """Abbreviate hotkey prefix for display."""
     mapping = {
         "right shift": "RShift",
         "left shift": "LShift",
@@ -915,6 +1380,7 @@ def _format_prefix(prefix: str) -> str:
         "left ctrl": "LCtrl",
         "right alt": "RAlt",
         "left alt": "LAlt",
+        "ctrl+alt": "Ctrl+Alt",
     }
     return mapping.get(prefix.lower(), prefix.title())
 
@@ -940,6 +1406,7 @@ def setup_tray():
         MenuItem("Settings...", lambda icon, item: open_settings()),
         MenuItem("Transcription History...", lambda icon, item: open_history()),
         Menu.SEPARATOR,
+        MenuItem("Transcribe today...", lambda icon, item: run_daily_transcription()),
         MenuItem(
             "Pause hotkeys",
             on_pause_toggle,
