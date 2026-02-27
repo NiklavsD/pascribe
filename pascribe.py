@@ -245,10 +245,12 @@ _current_cancel = threading.Event()
 _cancel_lock = threading.Lock()
 _settings_window_open = False
 _history_window_open = False
+_daily_transcripts_window_open = False
 _paused = False
 _transcribing = False
 _transcribing_lock = threading.Lock()
 daily_recorder = None
+_instance_lock = None  # socket held to prevent multiple instances
 
 # ─── Audio Capture ────────────────────────────────────────────────────────────
 
@@ -1296,6 +1298,223 @@ def open_history():
 
     threading.Thread(target=run_history, daemon=True).start()
 
+# ─── Daily Transcripts Viewer ────────────────────────────────────────────────
+
+def open_daily_transcripts():
+    """Open the Daily Transcripts viewer (tkinter) in a new thread."""
+    global _daily_transcripts_window_open
+    if _daily_transcripts_window_open:
+        return
+    _daily_transcripts_window_open = True
+
+    def run_viewer():
+        global _daily_transcripts_window_open
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+
+            root = tk.Tk()
+            root.title("Pascribe — Daily Transcripts")
+            root.geometry("900x580")
+            root.minsize(640, 400)
+
+            try:
+                ttk.Style().theme_use("vista")
+            except Exception:
+                pass
+
+            # ── Layout: left date list | right transcript pane ──
+            paned = tk.PanedWindow(root, orient=tk.HORIZONTAL, sashwidth=5,
+                                   sashrelief=tk.FLAT, bg="#e5e7eb")
+            paned.pack(fill=tk.BOTH, expand=True)
+
+            # Left: date list
+            left = ttk.Frame(paned, width=140)
+            paned.add(left, minsize=110)
+
+            ttk.Label(left, text="Dates", font=("Segoe UI", 9, "bold")).pack(
+                anchor="w", padx=8, pady=(8, 2)
+            )
+            date_lb = tk.Listbox(left, activestyle="dotbox", selectmode=tk.SINGLE,
+                                 font=("Segoe UI", 9), relief=tk.FLAT,
+                                 selectbackground="#3b82f6", selectforeground="white",
+                                 exportselection=False)
+            date_scroll = ttk.Scrollbar(left, command=date_lb.yview)
+            date_lb.configure(yscrollcommand=date_scroll.set)
+            date_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            date_lb.pack(fill=tk.BOTH, expand=True, padx=(8, 0), pady=(0, 8))
+
+            # Right: search bar + text + bottom bar
+            right = ttk.Frame(paned)
+            paned.add(right, minsize=400)
+
+            # Search bar
+            search_frame = ttk.Frame(right)
+            search_frame.pack(fill=tk.X, padx=8, pady=(8, 4))
+            ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT)
+            search_var = tk.StringVar()
+            search_entry = ttk.Entry(search_frame, textvariable=search_var, width=28)
+            search_entry.pack(side=tk.LEFT, padx=(4, 8))
+            filter_var = tk.StringVar(value="all")
+            ttk.Radiobutton(search_frame, text="All",     variable=filter_var, value="all"    ).pack(side=tk.LEFT)
+            ttk.Radiobutton(search_frame, text="You",     variable=filter_var, value="you"    ).pack(side=tk.LEFT, padx=(4, 0))
+            ttk.Radiobutton(search_frame, text="Discord", variable=filter_var, value="discord").pack(side=tk.LEFT, padx=(4, 0))
+
+            # Transcript text widget
+            txt_frame = ttk.Frame(right)
+            txt_frame.pack(fill=tk.BOTH, expand=True, padx=8)
+            txt = tk.Text(txt_frame, wrap=tk.WORD, font=("Segoe UI", 9),
+                          relief=tk.FLAT, state=tk.DISABLED, cursor="arrow",
+                          padx=6, pady=4, spacing1=1, spacing3=2)
+            txt_sb = ttk.Scrollbar(txt_frame, command=txt.yview)
+            txt.configure(yscrollcommand=txt_sb.set)
+            txt_sb.pack(side=tk.RIGHT, fill=tk.Y)
+            txt.pack(fill=tk.BOTH, expand=True)
+
+            # Speaker colour tags
+            txt.tag_configure("you",      foreground="#2563eb", font=("Segoe UI", 9, "bold"))
+            txt.tag_configure("discord",  foreground="#059669", font=("Segoe UI", 9, "bold"))
+            txt.tag_configure("ts",       foreground="#9ca3af", font=("Segoe UI", 8))
+            txt.tag_configure("body",     font=("Segoe UI", 9))
+            txt.tag_configure("search",   background="#fef08a")
+            txt.tag_configure("selected", background="#dbeafe")
+
+            # Bottom bar
+            bot = ttk.Frame(right)
+            bot.pack(fill=tk.X, padx=8, pady=(4, 8))
+            status_var = tk.StringVar(value="Select a date")
+            ttk.Label(bot, textvariable=status_var, foreground="gray").pack(side=tk.LEFT)
+            ttk.Button(bot, text="Copy All",     command=lambda: _copy_filtered("all")    ).pack(side=tk.RIGHT, padx=(4, 0))
+            ttk.Button(bot, text="Copy Discord", command=lambda: _copy_filtered("discord")).pack(side=tk.RIGHT, padx=(4, 0))
+            ttk.Button(bot, text="Copy You",     command=lambda: _copy_filtered("you")    ).pack(side=tk.RIGHT, padx=(4, 0))
+
+            # State
+            _current_segments: list[dict] = []
+
+            def _copy_filtered(speaker: str):
+                segs = _current_segments if speaker == "all" else [
+                    s for s in _current_segments if s.get("speaker") == speaker
+                ]
+                if not segs:
+                    return
+                text = "\n".join(f"[{s['time']}] {s['text']}" for s in segs)
+                root.clipboard_clear()
+                root.clipboard_append(text)
+                status_var.set(f"Copied {len(segs)} segments")
+                root.after(2000, lambda: status_var.set(f"{len(_current_segments)} segments"))
+
+            def _render(segs: list[dict]):
+                """Re-render the transcript text widget from segment list."""
+                txt.configure(state=tk.NORMAL)
+                txt.delete("1.0", tk.END)
+                q = search_var.get().strip().lower()
+                filt = filter_var.get()
+                shown = 0
+                for seg in segs:
+                    spk = seg.get("speaker", "unknown")
+                    if filt != "all" and spk != filt:
+                        continue
+                    t = seg.get("time", "")
+                    body = seg.get("text", "")
+                    if q and q not in body.lower() and q not in spk:
+                        continue
+                    tag = "you" if spk == "you" else "discord"
+                    label = "YOU" if spk == "you" else "DISC"
+                    txt.insert(tk.END, f"[{t}] ", "ts")
+                    txt.insert(tk.END, f"[{label}] ", tag)
+                    # Highlight search matches inside body
+                    if q:
+                        low = body.lower()
+                        idx = 0
+                        while True:
+                            pos = low.find(q, idx)
+                            if pos == -1:
+                                txt.insert(tk.END, body[idx:], "body")
+                                break
+                            txt.insert(tk.END, body[idx:pos], "body")
+                            txt.insert(tk.END, body[pos:pos+len(q)], "search")
+                            idx = pos + len(q)
+                    else:
+                        txt.insert(tk.END, body, "body")
+                    txt.insert(tk.END, "\n")
+                    shown += 1
+                txt.configure(state=tk.DISABLED)
+                status_var.set(f"{shown} of {len(segs)} segments")
+
+            def _click_copy(event):
+                """Click on a line → copy that segment to clipboard."""
+                idx = txt.index(f"@{event.x},{event.y}")
+                line_start = txt.index(f"{idx} linestart")
+                line_end   = txt.index(f"{idx} lineend")
+                line_text  = txt.get(line_start, line_end).strip()
+                if line_text:
+                    root.clipboard_clear()
+                    root.clipboard_append(line_text)
+                    txt.tag_remove("selected", "1.0", tk.END)
+                    txt.tag_add("selected", line_start, line_end + "+1c")
+                    status_var.set("Line copied")
+                    root.after(1500, lambda: status_var.set(f"{len(_current_segments)} segments"))
+
+            txt.bind("<Button-1>", _click_copy)
+
+            def _load_date(event=None):
+                nonlocal _current_segments
+                sel = date_lb.curselection()
+                if not sel:
+                    return
+                chosen = date_lb.get(sel[0])  # "YYYY-MM-DD"
+                rec_path = Path(config.get("recording_path", "recordings"))
+                tf = rec_path / chosen / "transcript.json"
+                if not tf.exists():
+                    txt.configure(state=tk.NORMAL)
+                    txt.delete("1.0", tk.END)
+                    txt.insert(tk.END, "No transcript yet for this date.\nUse 'Transcribe today...' from the tray.")
+                    txt.configure(state=tk.DISABLED)
+                    status_var.set("No transcript")
+                    _current_segments = []
+                    return
+                with open(tf, encoding="utf-8") as f:
+                    data = json.load(f)
+                _current_segments = data.get("segments", [])
+                mins = data.get("speech_minutes", 0)
+                words = data.get("word_count", 0)
+                root.title(f"Pascribe — {chosen}  ({words} words, {mins:.0f} min speech)")
+                _render(_current_segments)
+
+            def _on_filter_change(*_):
+                if _current_segments:
+                    _render(_current_segments)
+
+            search_var.trace_add("write", _on_filter_change)
+            filter_var.trace_add("write", _on_filter_change)
+            date_lb.bind("<<ListboxSelect>>", _load_date)
+
+            # Populate date list
+            rec_path = Path(config.get("recording_path", "recordings"))
+            if rec_path.exists():
+                dates = sorted(
+                    [d.name for d in rec_path.iterdir() if d.is_dir()],
+                    reverse=True
+                )
+                for d in dates:
+                    has_transcript = (rec_path / d / "transcript.json").exists()
+                    label = d if has_transcript else f"{d} ·"
+                    date_lb.insert(tk.END, d)
+                    if not has_transcript:
+                        date_lb.itemconfig(tk.END, foreground="#9ca3af")
+                if dates:
+                    date_lb.selection_set(0)
+                    date_lb.event_generate("<<ListboxSelect>>")
+            else:
+                status_var.set("No recordings folder found")
+
+            root.protocol("WM_DELETE_WINDOW", root.destroy)
+            root.mainloop()
+        finally:
+            _daily_transcripts_window_open = False
+
+    threading.Thread(target=run_viewer, daemon=True).start()
+
 # ─── Windows Startup Toggle ──────────────────────────────────────────────────
 
 STARTUP_DIR = (
@@ -1394,17 +1613,22 @@ def setup_tray():
         for k, v in sorted(hotkeys.items(), key=lambda x: int(x[0]))
     )
 
+    daily_on = config.get("daily_recording", False)
+    daily_label = "● Recording daily" if daily_on else "○ Daily recording off"
+
     menu = Menu(
-        MenuItem("Pascribe v0.3", lambda: None, enabled=False),
+        MenuItem("Pascribe v0.4", lambda: None, enabled=False),
         MenuItem(
             f"Buffer: {config['buffer_minutes']}min | {config['whisper_model']}",
             lambda: None,
             enabled=False,
         ),
         MenuItem(f"{prefix_short} + {hotkey_info}", lambda: None, enabled=False),
+        MenuItem(daily_label, lambda: None, enabled=False),
         Menu.SEPARATOR,
         MenuItem("Settings...", lambda icon, item: open_settings()),
         MenuItem("Transcription History...", lambda icon, item: open_history()),
+        MenuItem("Daily Transcripts...", lambda icon, item: open_daily_transcripts()),
         Menu.SEPARATOR,
         MenuItem("Transcribe today...", lambda icon, item: run_daily_transcription()),
         MenuItem(
@@ -1431,8 +1655,26 @@ def setup_tray():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def _acquire_instance_lock() -> bool:
+    """Bind a local socket to prevent duplicate instances. Returns True if acquired."""
+    global _instance_lock
+    import socket as _sock
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 0)
+    try:
+        s.bind(("127.0.0.1", 47823))
+        _instance_lock = s  # keep alive
+        return True
+    except OSError:
+        return False
+
+
 def main():
-    log.info("Pascribe v0.3 starting")
+    if not _acquire_instance_lock():
+        log.warning("Pascribe is already running — exiting duplicate")
+        sys.exit(0)
+
+    log.info("Pascribe v0.4 starting")
 
     # Start audio capture — app continues even if no streams start
     streams = start_audio_streams()
