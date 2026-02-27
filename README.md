@@ -2,7 +2,7 @@
 
 Rolling audio buffer → hotkey → Whisper transcription → clipboard.
 
-Captures mic + system audio (Voicemeeter, WASAPI loopback, Stereo Mix) into a 60-minute rolling buffer. Press a hotkey to transcribe the last N minutes and copy to clipboard.
+Captures mic and system audio into a rolling RAM buffer. Press a hotkey to transcribe the last N minutes to clipboard. Optionally records full-day audio for end-of-day speaker-labeled transcription via AssemblyAI.
 
 ## Setup
 
@@ -18,53 +18,139 @@ install.bat
 run.bat
 ```
 
-On first launch, you'll be asked to select your audio devices (mic + system audio). Picks are saved to `config.json`.
+On first launch, Pascribe starts in the system tray. **Left-click** the icon to open the control panel, or **right-click** for the quick menu. Select your audio devices in Settings.
 
-### Hotkeys (Right Shift + number)
+## Control Panel
+
+Left-click the tray icon to open the unified control panel with four tabs:
+
+| Tab | Contents |
+|-----|----------|
+| **Dashboard** | Live status indicator, quick-transcribe buttons, Pause/Resume, Transcribe Today, Run on Startup toggle, last transcript preview |
+| **History** | Scrollable list of past quick-transcriptions — click a row to copy |
+| **Daily Transcripts** | Browse speaker-labeled daily transcripts by date; search, filter by speaker, click-to-copy line, copy all buttons |
+| **Settings** | All configuration: devices, Whisper model, hotkeys, API key, homelab URL, daily recording options |
+
+## Hotkeys (Ctrl+Alt + number)
 
 | Key | Duration |
 |-----|----------|
-| RShift + 9 | 1 min |
-| RShift + 8 | 3 min |
-| RShift + 7 | 5 min |
-| RShift + 1 | 10 min |
-| RShift + 2 | 20 min |
-| RShift + 3 | 30 min |
-| RShift + 4 | 40 min |
-| RShift + 5 | 50 min |
-| RShift + 6 | 60 min |
+| Ctrl+Alt+9 | 1 min |
+| Ctrl+Alt+8 | 3 min |
+| Ctrl+Alt+7 | 5 min |
+| Ctrl+Alt+1 | 10 min |
+| Ctrl+Alt+2 | 20 min |
+| Ctrl+Alt+3 | 30 min |
+| Ctrl+Alt+4 | 40 min |
+| Ctrl+Alt+5 | 50 min |
+| Ctrl+Alt+6 | 60 min |
 
-Customize hotkeys in `config.json`.
+Customize prefix and key mappings in the Settings tab or `config.json`.
 
-## Config
+## Daily Recording + AssemblyAI Transcription
 
-Edit `config.json` to change devices, model, hotkeys:
+Enable **daily recording** in Settings. Pascribe writes mic and system audio to separate raw files under `recordings/YYYY-MM-DD/`.
 
-```json
-{
-  "mic_device": 3,
-  "system_device": 5,
-  "whisper_model": "large-v3",
-  "whisper_device": "cuda",
-  "hotkeys": { "1": 10, "2": 20, "9": 1 },
-  "hotkey_prefix": "right shift"
-}
-```
+At end of day, click **Transcribe Today** (Dashboard tab or tray menu):
 
-Set device to `null` to re-trigger the setup wizard on next launch.
+1. Strips silence with energy VAD to reduce billable audio
+2. Uploads to AssemblyAI for transcription
+3. Assigns speaker labels ("you" vs "discord") by comparing mic vs system audio levels
+4. Saves `recordings/YYYY-MM-DD/transcript.json`
+5. Optionally POSTs the transcript to your homelab URL
+
+**Cost:** ~$12/month for 8h/day recording with AssemblyAI ($0.0035/min) after VAD reduces ~8h → ~2–3h billable audio.
 
 ## Voicemeeter
 
 If you use Voicemeeter to separate Discord audio from your mic:
-- **Mic device** → your physical mic or Voicemeeter output with your voice
-- **System device** → Voicemeeter output carrying Discord audio
 
-This lets Pascribe capture both tracks separately and mix them for transcription.
+- **Mic device** → your physical mic or Voicemeeter output carrying your voice
+- **System device** → Voicemeeter output carrying Discord/game audio
+
+This lets Pascribe capture both tracks separately: mixed for Whisper hotkey transcription, and separated for per-segment speaker labeling in daily transcripts.
+
+## OpenClaw Homelab Integration
+
+Set `homelab_url` in Settings to POST daily transcripts to your homelab server (e.g. an OpenClaw instance) after each transcription run.
+
+### Transcript payload format
+
+```json
+{
+  "date": "2026-02-28",
+  "recorded_from": "2026-02-28T09:12:00",
+  "duration_minutes": 480.0,
+  "speech_minutes": 87.3,
+  "word_count": 12400,
+  "segments": [
+    {"time": "09:14:22", "speaker": "you",     "text": "Hey, what did you think of that?"},
+    {"time": "09:14:35", "speaker": "discord", "text": "Honestly pretty good."}
+  ]
+}
+```
+
+The payload is HTTP POSTed as JSON to your `homelab_url`. Pascribe uses `Content-Type: application/json`.
+
+### Minimal Flask receiver
+
+```python
+from flask import Flask, request, jsonify
+import json, pathlib
+
+app = Flask(__name__)
+
+@app.route("/api/transcript", methods=["POST"])
+def receive_transcript():
+    data = request.get_json()
+    date = data["date"]
+    out = pathlib.Path(f"transcripts/{date}.json")
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    print(f"[{date}] {data['word_count']} words, {data['speech_minutes']:.0f} min speech")
+    return jsonify({"ok": True})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+```
+
+Set `homelab_url` to `http://your-server:8080/api/transcript`.
+
+Each `segment` has:
+- `time` — wall-clock timestamp (`HH:MM:SS`)
+- `speaker` — `"you"` (mic) or `"discord"` (system audio)
+- `text` — transcribed text for that utterance
+
+## Config
+
+All options are editable in the Settings panel. Key `config.json` fields:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `hotkey_prefix` | `"ctrl+alt"` | Modifier for transcription hotkeys |
+| `hotkeys` | `{"9":1,"8":3,...}` | Key → minutes mapping |
+| `whisper_model` | `"large-v3"` | faster-whisper model size |
+| `whisper_device` | `"cuda"` | `"cuda"` or `"cpu"` |
+| `buffer_minutes` | `60` | Rolling RAM buffer size |
+| `daily_recording` | `false` | Enable disk recording |
+| `recording_path` | `"recordings"` | Where daily audio is stored |
+| `assemblyai_key` | `""` | AssemblyAI API key |
+| `homelab_url` | `null` | HTTP endpoint for daily transcripts |
+| `delete_after_transcribe` | `false` | Delete raw audio after transcription |
+
+Set `mic_device` or `system_device` to `null` to re-trigger device selection on next launch.
+
+## Safety Features
+
+- **VRAM check** — refuses to load Whisper if insufficient GPU memory (prevents OOM crashes while gaming)
+- **Hallucination filter** — discards known phantom Whisper outputs on near-silence audio
+- **Single-instance lock** — prevents duplicate tray instances from accumulating
+- **Pause hotkeys** — toggle via the Dashboard or tray menu to disable all hotkeys temporarily
 
 ## Requirements
 
 - Windows 10/11
 - Python 3.11+
 - NVIDIA GPU with CUDA (recommended) — or set `whisper_device: "cpu"`
-- ~1.5GB VRAM for large-v3 model
-- ~600MB RAM for 60-min audio buffer
+- ~3.5 GB VRAM for large-v3 model
+- ~600 MB RAM for 60-min audio buffer
