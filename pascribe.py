@@ -500,6 +500,7 @@ class DailyAudioRecorder:
         self._mic_fh = None
         self._sys_fh = None
         self._current_date: str | None = None
+        self._write_dtype: str = "int16"  # format for new recordings
 
     def write_mic(self, data: np.ndarray, capture_rate: int):
         self._write("mic", data, capture_rate)
@@ -516,7 +517,10 @@ class DailyAudioRecorder:
                 self._rotate(today)
             fh = self._mic_fh if stream == "mic" else self._sys_fh
             if fh:
-                fh.write(data.astype(np.float32).tobytes())
+                if self._write_dtype == "int16":
+                    fh.write((data * 32767).clip(-32768, 32767).astype(np.int16).tobytes())
+                else:
+                    fh.write(data.astype(np.float32).tobytes())
 
     def _rotate(self, today: str):
         self._close()
@@ -526,12 +530,18 @@ class DailyAudioRecorder:
 
         meta_path = day_dir / "meta.json"
         if not meta_path.exists():
-            meta = {"started": datetime.now().isoformat(), "sample_rate": self.STORE_RATE}
+            # New day: write int16 (half the storage of float32)
+            self._write_dtype = "int16"
+            meta = {"started": datetime.now().isoformat(), "sample_rate": self.STORE_RATE, "dtype": "int16"}
             with open(meta_path, "w") as f:
                 json.dump(meta, f)
             log.info(f"Daily recording started: {day_dir}")
         else:
-            log.info(f"Daily recording resumed: {day_dir}")
+            # Resume: match whatever dtype the existing file uses
+            with open(meta_path) as f:
+                meta = json.load(f)
+            self._write_dtype = meta.get("dtype", "float32")
+            log.info(f"Daily recording resumed: {day_dir} ({self._write_dtype})")
 
         self._mic_fh = open(day_dir / "mic.raw", "ab")
         self._sys_fh = open(day_dir / "sys.raw", "ab")
@@ -572,11 +582,16 @@ def load_todays_recordings() -> tuple[np.ndarray | None, np.ndarray | None, date
     sample_rate = meta.get("sample_rate", 16000)
     started = datetime.fromisoformat(meta["started"])
 
+    raw_dtype = np.dtype(meta.get("dtype", "float32"))
+
     def load_raw(name: str) -> np.ndarray | None:
         p = day_dir / name
         if not p.exists() or p.stat().st_size == 0:
             return None
-        return np.frombuffer(p.read_bytes(), dtype=np.float32).copy()
+        audio = np.frombuffer(p.read_bytes(), dtype=raw_dtype).copy()
+        if raw_dtype == np.dtype("int16"):
+            audio = audio.astype(np.float32) / 32767.0
+        return audio
 
     return load_raw("mic.raw"), load_raw("sys.raw"), started, sample_rate
 
@@ -716,24 +731,36 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
     req = urllib.request.Request(
         f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes, headers=hdrs_bin, method="POST"
     )
-    with urllib.request.urlopen(req) as r:
-        upload_url = json.loads(r.read())["upload_url"]
+    try:
+        with urllib.request.urlopen(req) as r:
+            upload_url = json.loads(r.read())["upload_url"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"AssemblyAI upload {e.code}: {body[:400]}")
 
     # 2. Submit transcription job
     body = json.dumps({"audio_url": upload_url, "language_detection": True}).encode()
     req = urllib.request.Request(
         f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
     )
-    with urllib.request.urlopen(req) as r:
-        transcript_id = json.loads(r.read())["id"]
+    try:
+        with urllib.request.urlopen(req) as r:
+            transcript_id = json.loads(r.read())["id"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"AssemblyAI submit {e.code}: {body[:400]}")
     log.info(f"AssemblyAI job: {transcript_id}")
 
     # 3. Poll
     poll_url = f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}"
     while True:
         req = urllib.request.Request(poll_url, headers={"authorization": api_key})
-        with urllib.request.urlopen(req) as r:
-            result = json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req) as r:
+                result = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"AssemblyAI poll {e.code}: {body[:400]}")
         status = result["status"]
         if status == "completed":
             break
@@ -1202,34 +1229,41 @@ def _build_dashboard_tab(frame, root):
 
 
 def _build_history_tab(frame, root):
-    """History: scrollable list of past transcriptions, click to copy."""
+    """History: list of past transcriptions with full-text viewer below."""
     import tkinter as tk
     from tkinter import ttk
 
-    tree_frame = ttk.Frame(frame)
-    tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+    # Vertical split: top = list, bottom = full text viewer
+    paned = tk.PanedWindow(frame, orient=tk.VERTICAL, sashwidth=5,
+                           sashrelief=tk.FLAT, bg="#e5e7eb")
+    paned.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+
+    # ── Top: history list ─────────────────────────────────────────────────────
+    top_f = ttk.Frame(paned)
+    paned.add(top_f, minsize=120)
+
+    tree_f = ttk.Frame(top_f)
+    tree_f.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 4))
 
     columns = ("time", "duration", "words", "preview")
-    tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+    tree = ttk.Treeview(tree_f, columns=columns, show="headings", selectmode="browse")
     tree.heading("time",     text="Time")
     tree.heading("duration", text="Duration")
     tree.heading("words",    text="Words")
-    tree.heading("preview",  text="Text Preview")
+    tree.heading("preview",  text="Preview")
     tree.column("time",     width=140, minwidth=120)
     tree.column("duration", width=70,  minwidth=60)
-    tree.column("words",    width=60,  minwidth=50)
-    tree.column("preview",  width=400, minwidth=200)
-    sb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+    tree.column("words",    width=55,  minwidth=50)
+    tree.column("preview",  width=380, minwidth=150)
+    sb = ttk.Scrollbar(tree_f, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=sb.set)
     tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-    bot = ttk.Frame(frame)
-    bot.pack(fill=tk.X, side=tk.BOTTOM, padx=10, pady=(0, 8))
-    status_var = tk.StringVar(value="Click a row to copy text to clipboard")
-    ttk.Label(bot, textvariable=status_var, relief="sunken", padding=(5, 2)).pack(
-        side=tk.LEFT, fill=tk.X, expand=True
-    )
+    top_bot = ttk.Frame(top_f)
+    top_bot.pack(fill=tk.X, padx=10, pady=(0, 4))
+    list_status = ttk.Label(top_bot, text="Select a row to view", foreground="#6b7280")
+    list_status.pack(side=tk.LEFT)
     texts: dict[str, str] = {}
 
     def _load_entries():
@@ -1245,21 +1279,75 @@ def _build_history_tab(frame, root):
             mins    = entry.get("minutes", "?")
             words   = entry.get("word_count", "?")
             text    = entry.get("text", "")
-            preview = text[:100].replace("\n", " ")
+            preview = text.replace("\n", " ")[:120]
             iid = tree.insert("", "end", values=(time_str, f"{mins} min", words, preview))
             texts[iid] = text
+        list_status.config(text=f"{len(texts)} entries — select a row to view")
 
     _load_entries()
-    ttk.Button(bot, text="Refresh", command=_load_entries).pack(side=tk.RIGHT)
+    ttk.Button(top_bot, text="Refresh", command=_load_entries).pack(side=tk.RIGHT)
 
-    def on_select(_event):
+    # ── Bottom: full transcript viewer ────────────────────────────────────────
+    bot_f = ttk.Frame(paned)
+    paned.add(bot_f, minsize=120)
+
+    view_header = ttk.Frame(bot_f)
+    view_header.pack(fill=tk.X, padx=10, pady=(6, 2))
+    view_title = ttk.Label(view_header, text="Transcript", font=("Segoe UI", 9, "bold"),
+                           foreground="#374151")
+    view_title.pack(side=tk.LEFT)
+    copy_status = ttk.Label(view_header, text="", foreground="#6b7280")
+    copy_status.pack(side=tk.LEFT, padx=(10, 0))
+
+    txt_f = ttk.Frame(bot_f)
+    txt_f.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+
+    view_txt = tk.Text(
+        txt_f, wrap=tk.WORD, font=("Segoe UI", 9), relief=tk.FLAT,
+        state=tk.DISABLED, fg="#1f2937", padx=6, pady=6, spacing3=2,
+        bg="#fafafa",
+    )
+    view_sb = ttk.Scrollbar(txt_f, command=view_txt.yview)
+    view_txt.configure(yscrollcommand=view_sb.set)
+    view_sb.pack(side=tk.RIGHT, fill=tk.Y)
+    view_txt.pack(fill=tk.BOTH, expand=True)
+
+    # Tags for timestamp formatting
+    view_txt.tag_configure("ts",   foreground="#9ca3af", font=("Segoe UI", 8))
+    view_txt.tag_configure("body", font=("Segoe UI", 9))
+
+    def _copy_current():
         sel = tree.selection()
         if sel:
             full_text = texts.get(sel[0], "")
             if full_text:
                 pyperclip.copy(full_text)
-                status_var.set("Copied to clipboard!")
-                root.after(2000, lambda: status_var.set("Click a row to copy text to clipboard"))
+                copy_status.config(text="Copied!")
+                root.after(2000, lambda: copy_status.config(text=""))
+
+    ttk.Button(view_header, text="Copy", command=_copy_current).pack(side=tk.RIGHT)
+
+    def on_select(_event):
+        sel = tree.selection()
+        if not sel:
+            return
+        full_text = texts.get(sel[0], "")
+        view_txt.configure(state=tk.NORMAL)
+        view_txt.delete("1.0", tk.END)
+        if full_text:
+            for line in full_text.split("\n"):
+                if line.startswith("[") and "]" in line:
+                    # timestamp line: colour the [mm:ss] part
+                    bracket_end = line.index("]") + 1
+                    view_txt.insert(tk.END, line[:bracket_end] + " ", "ts")
+                    view_txt.insert(tk.END, line[bracket_end:].strip() + "\n", "body")
+                else:
+                    view_txt.insert(tk.END, line + "\n", "body")
+        view_txt.configure(state=tk.DISABLED)
+        view_txt.yview_moveto(0)
+        # update title
+        vals = tree.item(sel[0], "values")
+        view_title.config(text=f"Transcript — {vals[0]}  ({vals[1]}, {vals[2]} words)")
 
     tree.bind("<<TreeviewSelect>>", on_select)
 
@@ -1304,6 +1392,11 @@ def _build_transcripts_tab(frame, root):
         ttk.Radiobutton(
             search_frame, text=label, variable=filter_var, value=val
         ).pack(side=tk.LEFT, padx=(0 if val == "all" else 4, 0))
+
+    ttk.Separator(search_frame, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8)
+    plain_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(search_frame, text="Plain text", variable=plain_var,
+                    command=lambda: _on_filter_change()).pack(side=tk.LEFT)
 
     txt_frame = ttk.Frame(right)
     txt_frame.pack(fill=tk.BOTH, expand=True, padx=8)
@@ -1350,6 +1443,7 @@ def _build_transcripts_tab(frame, root):
         txt.delete("1.0", tk.END)
         q    = search_var.get().strip().lower()
         filt = filter_var.get()
+        plain = plain_var.get()
         shown = 0
         for seg in segs:
             spk  = seg.get("speaker", "unknown")
@@ -1359,24 +1453,28 @@ def _build_transcripts_tab(frame, root):
             body = seg.get("text", "")
             if q and q not in body.lower() and q not in spk:
                 continue
-            tag   = "you" if spk == "you" else "discord"
-            label = "YOU" if spk == "you" else "DISC"
-            txt.insert(tk.END, f"[{t}] ", "ts")
-            txt.insert(tk.END, f"[{label}] ", tag)
-            if q:
-                low = body.lower()
-                idx = 0
-                while True:
-                    pos = low.find(q, idx)
-                    if pos == -1:
-                        txt.insert(tk.END, body[idx:], "body")
-                        break
-                    txt.insert(tk.END, body[idx:pos], "body")
-                    txt.insert(tk.END, body[pos:pos + len(q)], "search")
-                    idx = pos + len(q)
+            if plain:
+                # plain text: just the text, no speaker labels or highlights
+                txt.insert(tk.END, body + "\n", "body")
             else:
-                txt.insert(tk.END, body, "body")
-            txt.insert(tk.END, "\n")
+                tag   = "you" if spk == "you" else "discord"
+                label = "YOU" if spk == "you" else "DISC"
+                txt.insert(tk.END, f"[{t}] ", "ts")
+                txt.insert(tk.END, f"[{label}] ", tag)
+                if q:
+                    low = body.lower()
+                    idx = 0
+                    while True:
+                        pos = low.find(q, idx)
+                        if pos == -1:
+                            txt.insert(tk.END, body[idx:], "body")
+                            break
+                        txt.insert(tk.END, body[idx:pos], "body")
+                        txt.insert(tk.END, body[pos:pos + len(q)], "search")
+                        idx = pos + len(q)
+                else:
+                    txt.insert(tk.END, body, "body")
+                txt.insert(tk.END, "\n")
             shown += 1
         txt.configure(state=tk.DISABLED)
         status_var.set(f"{shown} of {len(segs)} segments")
@@ -1490,21 +1588,33 @@ def _build_settings_tab(frame, root):
         device_ids.append(dev_id)
         device_names.append(name)
 
-    def _find_label(dev_id):
+    def _find_label(dev_id, dev_name=None):
+        # Prefer name-based match (reliable across reboots)
+        if dev_name:
+            for i, name in enumerate(device_names):
+                if name == dev_name:
+                    return device_labels[i]
         for i, did in enumerate(device_ids):
             if did == dev_id:
                 return device_labels[i]
         return "(None)"
 
-    mic_var = tk.StringVar(value=_find_label(config["mic_device"]))
+    mic_var = tk.StringVar(value=_find_label(config["mic_device"], config.get("mic_device_name")))
     r = _field_row("Microphone:")
     ttk.Combobox(r, textvariable=mic_var, values=device_labels,
                  state="readonly", width=55).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-    sys_var = tk.StringVar(value=_find_label(config["system_device"]))
+    sys_var = tk.StringVar(value=_find_label(config["system_device"], config.get("system_device_name")))
     r = _field_row("System Audio:")
     ttk.Combobox(r, textvariable=sys_var, values=device_labels,
                  state="readonly", width=55).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _hint(text: str):
+        ttk.Label(inner, text=text, foreground="#9ca3af", font=("Segoe UI", 8)).pack(
+            anchor="w", padx=14, pady=(0, 6)
+        )
+
+    _hint("Device changes require a restart to take effect.")
 
     _section("Transcription")
 
@@ -1513,54 +1623,69 @@ def _build_settings_tab(frame, root):
     ttk.Combobox(r, textvariable=model_var,
                  values=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
                  state="readonly", width=18).pack(side=tk.LEFT)
+    _hint("larger = more accurate, more VRAM. large-v3 needs ~3.5 GB VRAM")
 
     wdev_var = tk.StringVar(value=config.get("whisper_device", "cuda"))
     r = _field_row("Whisper Device:")
     ttk.Radiobutton(r, text="CUDA (GPU)", variable=wdev_var, value="cuda").pack(side=tk.LEFT)
     ttk.Radiobutton(r, text="CPU",        variable=wdev_var, value="cpu" ).pack(side=tk.LEFT, padx=(12, 0))
+    _hint("CUDA requires an NVIDIA GPU. CPU works everywhere but is much slower.")
 
     buf_var = tk.IntVar(value=config.get("buffer_minutes", 60))
     r = _field_row("Buffer (minutes):")
     ttk.Spinbox(r, from_=5, to=240, increment=5, textvariable=buf_var, width=8).pack(side=tk.LEFT)
+    _hint("How much audio is kept in RAM for quick hotkey transcription.")
 
     prefix_var = tk.StringVar(value=config.get("hotkey_prefix", "ctrl+alt"))
     r = _field_row("Hotkey Prefix:")
     ttk.Entry(r, textvariable=prefix_var, width=22).pack(side=tk.LEFT)
-    ttk.Label(r, text="(e.g. ctrl+alt, right shift)", foreground="#9ca3af").pack(
+    ttk.Label(r, text="e.g. ctrl+alt, right shift", foreground="#9ca3af").pack(
         side=tk.LEFT, padx=(8, 0)
     )
+    _hint("ctrl+alt is safe for gaming. Change requires a restart.")
 
     _section("Daily Recording")
 
     daily_var = tk.BooleanVar(value=config.get("daily_recording", False))
     ttk.Checkbutton(
         inner,
-        text="Enable daily recording (saves audio to disk for end-of-day transcription)",
+        text="Enable daily recording — saves audio to disk for end-of-day transcription",
         variable=daily_var,
-    ).pack(anchor="w", padx=14, pady=(0, 8))
+    ).pack(anchor="w", padx=14, pady=(0, 4))
+    _hint("Stores ~32 KB/s per stream (int16 PCM). Two streams = ~1.75 GB per 8-hour day.")
 
     path_var = tk.StringVar(value=config.get("recording_path", "recordings"))
     r = _field_row("Recording Path:")
-    ttk.Entry(r, textvariable=path_var, width=35).pack(side=tk.LEFT, fill=tk.X, expand=True)
+    ttk.Entry(r, textvariable=path_var, width=30).pack(side=tk.LEFT, fill=tk.X, expand=True)
+    def _browse_path():
+        from tkinter.filedialog import askdirectory
+        d = askdirectory(title="Select Recording Folder",
+                         initialdir=path_var.get() if Path(path_var.get()).exists() else ".")
+        if d:
+            path_var.set(d)
+    ttk.Button(r, text="Browse…", command=_browse_path, width=8).pack(side=tk.LEFT, padx=(4, 0))
 
     key_var = tk.StringVar(value=config.get("assemblyai_key", ""))
     r = _field_row("AssemblyAI Key:")
-    key_entry = ttk.Entry(r, textvariable=key_var, show="*", width=42)
+    key_entry = ttk.Entry(r, textvariable=key_var, show="*", width=38)
     key_entry.pack(side=tk.LEFT)
     show_var = tk.BooleanVar(value=False)
     ttk.Checkbutton(
         r, text="Show", variable=show_var,
         command=lambda: key_entry.config(show="" if show_var.get() else "*"),
     ).pack(side=tk.LEFT, padx=(6, 0))
+    _hint("Required for daily transcription. ~$0.0035/min billed after VAD silence stripping.")
 
     url_var = tk.StringVar(value=config.get("homelab_url") or "")
     r = _field_row("Homelab URL:")
     ttk.Entry(r, textvariable=url_var, width=45).pack(side=tk.LEFT, fill=tk.X, expand=True)
+    _hint("Optional. Daily transcripts will be HTTP POSTed as JSON to this endpoint.")
 
     del_var = tk.BooleanVar(value=config.get("delete_after_transcribe", False))
     ttk.Checkbutton(
         inner, text="Delete raw audio after successful transcription", variable=del_var
-    ).pack(anchor="w", padx=14, pady=(0, 8))
+    ).pack(anchor="w", padx=14, pady=(0, 4))
+    _hint("Frees disk space. Transcription must succeed first — raw files are never deleted on error.")
 
     ttk.Separator(inner, orient="horizontal").pack(fill=tk.X, padx=14, pady=(8, 6))
     status_var = tk.StringVar(value="")
@@ -1630,6 +1755,50 @@ def open_main_panel(start_tab: int = 0):
                 ttk.Style().theme_use("vista")
             except Exception:
                 pass
+
+            # Set window icon using the same waveform image
+            try:
+                from PIL import ImageTk as _ImageTk
+                _icon = create_tray_image("green").resize((32, 32), Image.LANCZOS)
+                _photo = _ImageTk.PhotoImage(_icon)
+                root.iconphoto(True, _photo)
+                root._icon_ref = _photo  # prevent GC
+            except Exception:
+                pass
+
+            # Footer status bar
+            footer = ttk.Frame(root)
+            footer.pack(fill=tk.X, side=tk.BOTTOM)
+            ttk.Separator(footer, orient="horizontal").pack(fill=tk.X)
+            footer_inner = ttk.Frame(footer)
+            footer_inner.pack(fill=tk.X, padx=10, pady=3)
+            _ver_lbl = ttk.Label(footer_inner, text="Pascribe v0.5",
+                                 foreground="#9ca3af", font=("Segoe UI", 8))
+            _ver_lbl.pack(side=tk.LEFT)
+            _footer_status = ttk.Label(footer_inner, text="", foreground="#6b7280",
+                                       font=("Segoe UI", 8))
+            _footer_status.pack(side=tk.RIGHT)
+
+            def _update_footer():
+                try:
+                    if not root.winfo_exists():
+                        return
+                except Exception:
+                    return
+                if _paused:
+                    _footer_status.config(text="Hotkeys paused")
+                elif _transcribing:
+                    _footer_status.config(text="Transcribing…")
+                elif config.get("daily_recording"):
+                    rec_path = Path(config.get("recording_path", "recordings"))
+                    mic_f = rec_path / date.today().isoformat() / "mic.raw"
+                    mb = mic_f.stat().st_size / 1024 / 1024 if mic_f.exists() else 0
+                    _footer_status.config(text=f"Recording — {mb:.0f} MB today")
+                else:
+                    _footer_status.config(text="Ready")
+                root.after(2000, _update_footer)
+
+            _update_footer()
 
             nb = ttk.Notebook(root)
             nb.pack(fill=tk.BOTH, expand=True)
