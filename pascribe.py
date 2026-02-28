@@ -14,6 +14,7 @@ import logging
 import subprocess
 import urllib.request
 import urllib.error
+import winsound
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
@@ -252,21 +253,62 @@ _transcribing_lock = threading.Lock()
 daily_recorder = None
 _instance_lock = None  # socket held to prevent multiple instances
 
+# ─── Dark Theme Colors (Tokyo Night palette) ─────────────────────────────────
+_D = {
+    "BG":     "#1a1b26",   # base background
+    "BG2":    "#24283b",   # panel / labelframe background
+    "BG3":    "#2f334d",   # button / input background
+    "BG4":    "#414868",   # borders, sash, separators
+    "FG":     "#c0caf5",   # primary text
+    "FG2":    "#565f89",   # muted / hint text
+    "FG3":    "#a9b1d6",   # secondary text
+    "ACCENT": "#7aa2f7",   # blue accent / selection highlight
+    "GREEN":  "#9ece6a",   # success
+    "YELLOW": "#e0af68",   # warning
+    "RED":    "#f7768e",   # error / danger
+    "SEL_FG": "#1a1b26",   # text on selected/accent background
+}
+
+# ─── Audio Level Tracking (for real-time visualizer) ────────────────────────
+_mic_level: float = 0.0
+_sys_level: float = 0.0
+_mic_level_history: deque = deque(maxlen=86400)   # 1-sec RMS samples (up to 24 h)
+_sys_level_history: deque = deque(maxlen=86400)
+_viz_lock = threading.Lock()
+
+# Pre-loaded coarse waveform from today's raw file (populated in background)
+_waveform_hist_mic: list = []
+_waveform_hist_sys: list = []
+_WAVEFORM_HIST_STEP = 10          # seconds per historical sample
+_recording_start_time: datetime | None = None   # when today's session started
+
 # ─── Audio Capture ────────────────────────────────────────────────────────────
 
 def mic_callback(indata, frames, time_info, status):
+    global _mic_level
     if status:
         log.warning(f"Mic status: {status}")
     mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
+    mono = np.nan_to_num(mono, nan=0.0, posinf=0.0, neginf=0.0)
     mic_buffer.add_chunk(mono)
+    rms = float(np.sqrt(np.mean(mono.astype(np.float64) ** 2)))
+    _mic_level = rms
+    with _viz_lock:
+        _mic_level_history.append(rms)
     if daily_recorder:
         daily_recorder.write_mic(mono, mic_buffer.capture_rate)
 
 def loopback_callback(indata, frames, time_info, status):
+    global _sys_level
     if status:
         log.warning(f"Loopback status: {status}")
     mono = indata.mean(axis=1) if indata.ndim > 1 else indata.flatten()
+    mono = np.nan_to_num(mono, nan=0.0, posinf=0.0, neginf=0.0)
     loopback_buffer.add_chunk(mono)
+    rms = float(np.sqrt(np.mean(mono.astype(np.float64) ** 2)))
+    _sys_level = rms
+    with _viz_lock:
+        _sys_level_history.append(rms)
     if daily_recorder:
         daily_recorder.write_sys(mono, loopback_buffer.capture_rate)
 
@@ -343,6 +385,8 @@ def start_audio_streams():
     if config.get("daily_recording"):
         daily_recorder = DailyAudioRecorder(config.get("recording_path", "recordings"))
         log.info(f"Daily recording -> {config.get('recording_path', 'recordings')}/")
+        # Pre-load today's waveform history for the visualizer
+        threading.Thread(target=_load_day_waveform_bg, daemon=True).start()
 
     return streams
 
@@ -523,6 +567,7 @@ class DailyAudioRecorder:
                     fh.write(data.astype(np.float32).tobytes())
 
     def _rotate(self, today: str):
+        global _recording_start_time
         self._close()
         self._current_date = today
         day_dir = self.recording_path / today
@@ -532,15 +577,18 @@ class DailyAudioRecorder:
         if not meta_path.exists():
             # New day: write int16 (half the storage of float32)
             self._write_dtype = "int16"
-            meta = {"started": datetime.now().isoformat(), "sample_rate": self.STORE_RATE, "dtype": "int16"}
+            now = datetime.now()
+            meta = {"started": now.isoformat(), "sample_rate": self.STORE_RATE, "dtype": "int16"}
             with open(meta_path, "w") as f:
                 json.dump(meta, f)
+            _recording_start_time = now
             log.info(f"Daily recording started: {day_dir}")
         else:
             # Resume: match whatever dtype the existing file uses
             with open(meta_path) as f:
                 meta = json.load(f)
             self._write_dtype = meta.get("dtype", "float32")
+            _recording_start_time = datetime.fromisoformat(meta["started"])
             log.info(f"Daily recording resumed: {day_dir} ({self._write_dtype})")
 
         self._mic_fh = open(day_dir / "mic.raw", "ab")
@@ -559,6 +607,56 @@ class DailyAudioRecorder:
     def close(self):
         with self._lock:
             self._close()
+
+
+def _load_day_waveform_bg():
+    """Background: read today's raw audio files → populate _waveform_hist_* lists.
+
+    Uses coarse (_WAVEFORM_HIST_STEP-second) chunks so even an 8-hour file
+    loads in a few seconds without significant I/O pressure.
+    """
+    global _waveform_hist_mic, _waveform_hist_sys
+
+    rec_path = Path(config.get("recording_path", "recordings"))
+    day_dir  = rec_path / date.today().isoformat()
+    meta_f   = day_dir / "meta.json"
+    if not meta_f.exists():
+        return
+
+    with open(meta_f) as f:
+        meta = json.load(f)
+
+    sample_rate = meta.get("sample_rate", 16000)
+    dtype       = np.dtype(meta.get("dtype", "float32"))
+    bps         = dtype.itemsize
+    chunk_bytes = sample_rate * _WAVEFORM_HIST_STEP * bps
+
+    for raw_name, target in [("mic.raw", _waveform_hist_mic),
+                              ("sys.raw", _waveform_hist_sys)]:
+        p = day_dir / raw_name
+        if not p.exists():
+            continue
+        try:
+            with open(p, "rb") as f:
+                while True:
+                    raw = f.read(chunk_bytes)
+                    if len(raw) < bps:
+                        break
+                    n = len(raw) // bps
+                    audio = np.frombuffer(raw[:n * bps], dtype=dtype)
+                    if dtype == np.dtype("int16"):
+                        audio64 = audio.astype(np.float64) / 32767.0
+                    else:
+                        audio64 = audio.astype(np.float64)
+                    rms = float(np.sqrt(np.mean(audio64 ** 2)))
+                    target.append(rms)
+        except Exception as e:
+            log.warning(f"Waveform pre-load error ({raw_name}): {e}")
+
+    log.info(
+        f"Waveform loaded: {len(_waveform_hist_mic)} samples "
+        f"({len(_waveform_hist_mic) * _WAVEFORM_HIST_STEP / 60:.1f} min pre-recorded)"
+    )
 
 
 def load_todays_recordings() -> tuple[np.ndarray | None, np.ndarray | None, datetime | None, int]:
@@ -610,10 +708,11 @@ def _energy_vad(audio: np.ndarray, sample_rate: int,
         return []
 
     n_frames = len(audio) // frame_samples
+    audio64 = audio.astype(np.float64)
     frames_rms = np.array([
-        np.sqrt(np.mean(audio[i * frame_samples:(i + 1) * frame_samples] ** 2))
+        np.sqrt(np.mean(audio64[i * frame_samples:(i + 1) * frame_samples] ** 2))
         for i in range(n_frames)
-    ])
+    ], dtype=np.float64)
 
     if frames_rms.max() == 0:
         return []
@@ -828,7 +927,9 @@ def _daily_transcription_worker():
 
         if has_both:
             min_len = min(len(mic_audio), len(sys_audio))
-            mix = mic_audio[:min_len] * 0.5 + sys_audio[:min_len] * 0.5
+            _m = np.nan_to_num(mic_audio[:min_len], nan=0.0, posinf=0.0, neginf=0.0)
+            _s = np.nan_to_num(sys_audio[:min_len], nan=0.0, posinf=0.0, neginf=0.0)
+            mix = _m * 0.5 + _s * 0.5
         else:
             mix = mic_audio if mic_audio is not None else sys_audio
 
@@ -934,12 +1035,12 @@ def _daily_transcription_worker():
                     p.unlink()
             log.info("Raw audio deleted after transcription")
 
-        notify(f"Done — {word_count} words, {total_speech_s / 60:.0f} min of speech")
+        notify(f"Done — {word_count:,} words, {total_speech_s / 60:.0f} min speech", sound="success")
         update_tray_icon("green")
 
     except Exception as e:
         log.error(f"Daily transcription failed: {e}", exc_info=True)
-        notify(f"Daily transcription failed: {e}")
+        notify(f"Transcription failed: {e}", sound="error")
         update_tray_icon("red")
         threading.Timer(3, lambda: update_tray_icon("green")).start()
 
@@ -1005,7 +1106,9 @@ def _on_transcribe_inner(minutes: int):
     # Mix streams
     if mic_audio is not None and loopback_audio is not None:
         min_len = min(len(mic_audio), len(loopback_audio))
-        mixed = mic_audio[:min_len] * 0.5 + loopback_audio[:min_len] * 0.5
+        _m = np.nan_to_num(mic_audio[:min_len], nan=0.0, posinf=0.0, neginf=0.0)
+        _l = np.nan_to_num(loopback_audio[:min_len], nan=0.0, posinf=0.0, neginf=0.0)
+        mixed = _m * 0.5 + _l * 0.5
     elif mic_audio is not None:
         mixed = mic_audio
     else:
@@ -1033,7 +1136,7 @@ def _on_transcribe_inner(minutes: int):
             word_count = sum(len(t.split()) for _, _, t in segments)
             log.info(f"{word_count} words in {elapsed:.1f}s -> clipboard")
             update_tray_icon("green")
-            notify(f"{word_count} words in {elapsed:.1f}s")
+            notify(f"{word_count:,} words copied  ({elapsed:.1f}s)", sound="success")
             add_history_entry(minutes, word_count, elapsed, transcript)
         else:
             log.info("No speech detected")
@@ -1044,7 +1147,7 @@ def _on_transcribe_inner(minutes: int):
             return
         log.error(f"Transcription error: {e}")
         update_tray_icon("red")
-        notify(f"Error: {e}")
+        notify(f"Error: {e}", sound="error")
         threading.Timer(3, lambda: update_tray_icon("green")).start()
     finally:
         try:
@@ -1101,128 +1204,525 @@ def update_tray_icon(color: str):
     if tray_icon:
         tray_icon.icon = create_tray_image(color)
 
-def notify(message: str):
-    """Show a balloon notification and update the tray tooltip."""
-    if tray_icon:
-        tray_icon.title = f"Pascribe — {message}"
+def _play_sound(kind: str):
+    """Play a pleasant non-blocking musical cue.
+    success → C-E-G major arpeggio  |  error → falling minor 3rd  |  warn → double tap
+    """
+    def _beep():
         try:
-            tray_icon.notify(message, "Pascribe")
+            if kind == "success":
+                # C5 → E5 → G5  (ascending major arpeggio)
+                winsound.Beep(523, 70)
+                winsound.Beep(659, 70)
+                winsound.Beep(784, 110)
+            elif kind == "error":
+                # G4 → Eb4  (falling minor third — sorrowful)
+                winsound.Beep(392, 110)
+                winsound.Beep(311, 170)
+            elif kind == "warn":
+                # A4 × 2  (soft double-tap attention)
+                winsound.Beep(440, 70)
+                time.sleep(0.04)
+                winsound.Beep(440, 70)
         except Exception:
             pass
+    threading.Thread(target=_beep, daemon=True).start()
+
+def notify(message: str, sound: str = ""):
+    """Update the tray tooltip and optionally play a sound.
+    Balloon popups are intentionally skipped to avoid the Windows system ding.
+    """
+    if tray_icon:
+        tray_icon.title = f"Pascribe — {message}"
+    if sound:
+        _play_sound(sound)
+
+# ─── Dark Theme Setup ─────────────────────────────────────────────────────────
+
+def _apply_dark_theme(root):
+    """Configure ttk.Style with dark Tokyo Night palette on the given root."""
+    from tkinter import ttk
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    BG, BG2, BG3, BG4 = _D["BG"], _D["BG2"], _D["BG3"], _D["BG4"]
+    FG, FG2            = _D["FG"], _D["FG2"]
+    ACC                = _D["ACCENT"]
+    SEL                = _D["SEL_FG"]
+    RED                = _D["RED"]
+
+    style.configure(".",
+        background=BG, foreground=FG, fieldbackground=BG3,
+        insertcolor=FG, troughcolor=BG2,
+        selectbackground=ACC, selectforeground=SEL,
+        bordercolor=BG4, darkcolor=BG2, lightcolor=BG2,
+        relief="flat", borderwidth=0,
+    )
+    style.configure("TFrame",      background=BG)
+    style.configure("TLabel",      background=BG, foreground=FG)
+    style.configure("TLabelframe", background=BG, bordercolor=BG4, relief="solid", borderwidth=1)
+    style.configure("TLabelframe.Label", background=BG, foreground=FG2, font=("Segoe UI", 9, "bold"))
+
+    style.configure("TButton",
+        background=BG3, foreground=FG, padding=(10, 5),
+        relief="flat", borderwidth=0, focusthickness=0,
+    )
+    style.map("TButton",
+        background=[("active", BG4), ("pressed", BG4), ("disabled", BG2)],
+        foreground=[("active", FG), ("disabled", BG4)],
+    )
+
+    # Accent — primary CTA (blue)
+    style.configure("Accent.TButton",
+        background=ACC, foreground=SEL, padding=(10, 5),
+        relief="flat", borderwidth=0, font=("Segoe UI", 9, "bold"),
+    )
+    style.map("Accent.TButton",
+        background=[("active", "#6d93e5"), ("pressed", "#5b7ed0")],
+        foreground=[("active", SEL)],
+    )
+
+    # Danger — destructive action (red tint)
+    style.configure("Danger.TButton",
+        background="#3d1a1f", foreground=RED, padding=(10, 5),
+        relief="flat", borderwidth=0,
+    )
+    style.map("Danger.TButton",
+        background=[("active", "#5c2530"), ("pressed", "#7a3040"), ("disabled", BG2)],
+        foreground=[("active", RED), ("disabled", BG4)],
+    )
+
+    style.configure("TNotebook",     background=BG2, bordercolor=BG4, borderwidth=0)
+    style.configure("TNotebook.Tab", background=BG2, foreground=FG2, padding=(14, 6), borderwidth=0)
+    style.map("TNotebook.Tab",
+        background=[("selected", BG)],
+        foreground=[("selected", FG)],
+    )
+
+    style.configure("TEntry",
+        fieldbackground=BG3, foreground=FG, insertcolor=FG,
+        bordercolor=BG4, relief="flat", borderwidth=1,
+    )
+    style.configure("TCombobox",
+        fieldbackground=BG3, foreground=FG, insertcolor=FG,
+        selectbackground=ACC, selectforeground=SEL,
+        bordercolor=BG4, relief="flat",
+    )
+    style.map("TCombobox",
+        fieldbackground=[("readonly", BG3)],
+        foreground=[("readonly", FG)],
+        selectbackground=[("readonly", ACC)],
+    )
+    style.configure("TScrollbar",
+        background=BG3, troughcolor=BG2, bordercolor=BG,
+        arrowcolor=FG2, relief="flat", borderwidth=0, width=10,
+    )
+    style.map("TScrollbar", background=[("active", BG4)])
+
+    style.configure("TCheckbutton", background=BG, foreground=FG, indicatorcolor=BG3)
+    style.map("TCheckbutton",
+        background=[("active", BG)],
+        indicatorcolor=[("selected", ACC)],
+    )
+    style.configure("TRadiobutton", background=BG, foreground=FG, indicatorcolor=BG3)
+    style.map("TRadiobutton",
+        background=[("active", BG)],
+        indicatorcolor=[("selected", ACC)],
+    )
+    style.configure("TSeparator", background=BG4)
+
+    style.configure("Treeview",
+        background=BG2, foreground=FG, fieldbackground=BG2,
+        rowheight=24, borderwidth=0,
+    )
+    style.configure("Treeview.Heading",
+        background=BG3, foreground=FG2, relief="flat", padding=(4, 4), borderwidth=0,
+    )
+    style.map("Treeview",
+        background=[("selected", ACC)],
+        foreground=[("selected", SEL)],
+    )
+    style.configure("TSpinbox",
+        fieldbackground=BG3, foreground=FG, insertcolor=FG,
+        bordercolor=BG4, relief="flat", arrowcolor=FG2,
+    )
+
+
+# ─── Stop Recording Dialog ─────────────────────────────────────────────────────
+
+def _stop_recording_action(root=None):
+    """Show a modal dialog to stop today's recording with delete or keep options."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    if not daily_recorder:
+        return
+
+    BG, FG, FG2 = _D["BG"], _D["FG"], _D["FG2"]
+    BG3 = _D["BG3"]
+
+    dlg = tk.Toplevel(root)
+    dlg.title("Stop Recording")
+    dlg.geometry("380x170")
+    dlg.resizable(False, False)
+    dlg.configure(bg=BG)
+    if root:
+        dlg.transient(root)
+        dlg.grab_set()
+
+    tk.Label(dlg, text="Stop today's recording?",
+             font=("Segoe UI", 12, "bold"), bg=BG, fg=FG).pack(pady=(22, 4))
+    tk.Label(dlg, text="Choose whether to keep or delete today's raw audio files.",
+             font=("Segoe UI", 9), bg=BG, fg=FG2).pack(pady=(0, 18))
+
+    btn_row = tk.Frame(dlg, bg=BG)
+    btn_row.pack()
+
+    def _do(delete: bool):
+        global daily_recorder, _recording_start_time
+        dlg.destroy()
+        if daily_recorder:
+            daily_recorder.close()
+            daily_recorder = None
+        if delete:
+            rec_path = Path(config.get("recording_path", "recordings"))
+            day_dir = rec_path / date.today().isoformat()
+            deleted = 0
+            for name in ("mic.raw", "sys.raw", "meta.json"):
+                p = day_dir / name
+                if p.exists():
+                    p.unlink()
+                    deleted += 1
+            _recording_start_time = None
+            log.info(f"Recording stopped, {deleted} file(s) deleted")
+            notify("Recording stopped — today's audio deleted", sound="warn")
+        else:
+            log.info("Recording stopped (files kept)")
+            notify("Recording stopped — audio files kept")
+
+    ttk.Button(btn_row, text="⏹  Stop & Delete Audio", style="Danger.TButton",
+               command=lambda: _do(True)).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(btn_row, text="Stop (Keep Files)",
+               command=lambda: _do(False)).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(btn_row, text="Cancel",
+               command=dlg.destroy).pack(side=tk.LEFT)
+
+    if root:
+        root.wait_window(dlg)
+
 
 # ─── Panel Tab Builders ────────────────────────────────────────────────────────
 
 def _build_dashboard_tab(frame, root):
-    """Dashboard: live status, quick-transcribe buttons, actions, last transcript."""
+    """Dashboard: live status, audio visualizer, quick-transcribe, actions, last transcript."""
     import tkinter as tk
     from tkinter import ttk
 
-    # ── Status ────────────────────────────────────────────────────────────────
-    status_lf = ttk.LabelFrame(frame, text="Status", padding=10)
-    status_lf.pack(fill=tk.X, padx=14, pady=(14, 6))
+    BG   = _D["BG"]
+    BG2  = _D["BG2"]
+    BG3  = _D["BG3"]
+    BG4  = _D["BG4"]
+    FG   = _D["FG"]
+    FG2  = _D["FG2"]
+    ACC  = _D["ACCENT"]
+    GRN  = _D["GREEN"]
+    YEL  = _D["YELLOW"]
+    RED  = _D["RED"]
+    SEL  = _D["SEL_FG"]
 
-    dot = tk.Label(status_lf, text="●", font=("Segoe UI", 18), fg="#22c55e")
-    dot.grid(row=0, column=0, padx=(0, 8))
-    status_txt = ttk.Label(status_lf, text="Ready", font=("Segoe UI", 11, "bold"))
-    status_txt.grid(row=0, column=1, sticky="w")
-    info_txt = ttk.Label(status_lf, text="", foreground="#6b7280", font=("Segoe UI", 9))
-    info_txt.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    # ── Status Bar ────────────────────────────────────────────────────────────
+    status_bar = tk.Frame(frame, bg=BG2, height=50)
+    status_bar.pack(fill=tk.X, padx=12, pady=(12, 0))
+    status_bar.pack_propagate(False)
+
+    dot = tk.Label(status_bar, text="●", font=("Segoe UI", 18), fg=GRN, bg=BG2)
+    dot.pack(side=tk.LEFT, padx=(14, 8), pady=12)
+
+    txt_col = tk.Frame(status_bar, bg=BG2)
+    txt_col.pack(side=tk.LEFT, fill=tk.Y, pady=6)
+    status_txt = tk.Label(txt_col, text="Recording", font=("Segoe UI", 10, "bold"),
+                          fg=FG, bg=BG2, anchor="w")
+    status_txt.pack(anchor="w")
+    info_txt = tk.Label(txt_col, text="", fg=FG2, bg=BG2, font=("Segoe UI", 8), anchor="w")
+    info_txt.pack(anchor="w")
+
+    today_lbl = tk.Label(status_bar, text="", fg=FG2, bg=BG2, font=("Segoe UI", 8))
+    today_lbl.pack(side=tk.RIGHT, padx=14)
+
+    # ── Audio Visualizer ──────────────────────────────────────────────────────
+    # Two-row waveform: MIC (top) / SYS (bottom), timeline from recording start → now
+    viz_canvas = tk.Canvas(frame, height=118, bg=BG2, highlightthickness=0)
+    viz_canvas.pack(fill=tk.X, padx=12, pady=(8, 2))
 
     # ── Quick Transcribe ──────────────────────────────────────────────────────
-    qt_lf = ttk.LabelFrame(frame, text="Quick Transcribe", padding=10)
-    qt_lf.pack(fill=tk.X, padx=14, pady=(0, 6))
-    ttk.Label(
-        qt_lf,
-        text="Transcribe the last N minutes and copy to clipboard:",
-        foreground="#6b7280",
-    ).pack(anchor="w", pady=(0, 8))
-    btn_row = ttk.Frame(qt_lf)
-    btn_row.pack(anchor="w")
+    qt_f = tk.Frame(frame, bg=BG)
+    qt_f.pack(fill=tk.X, padx=12, pady=(12, 0))
+
+    tk.Label(qt_f, text="QUICK TRANSCRIBE", font=("Segoe UI", 7, "bold"),
+             fg=FG2, bg=BG).pack(anchor="w", pady=(0, 5))
+
+    qt_btn_row = tk.Frame(qt_f, bg=BG)
+    qt_btn_row.pack(anchor="w")
     for m in sorted(set(config.get("hotkeys", {}).values())):
         def _make_cmd(mins=m):
             def _cmd():
                 threading.Thread(target=on_transcribe, args=(mins,), daemon=True).start()
             return _cmd
-        ttk.Button(btn_row, text=f"{m} min", width=7, command=_make_cmd()).pack(
-            side=tk.LEFT, padx=2, pady=1
+        ttk.Button(qt_btn_row, text=f"{m}m", width=5, command=_make_cmd()).pack(
+            side=tk.LEFT, padx=(0, 4), pady=1
         )
 
     # ── Actions ───────────────────────────────────────────────────────────────
-    act_lf = ttk.LabelFrame(frame, text="Actions", padding=10)
-    act_lf.pack(fill=tk.X, padx=14, pady=(0, 6))
-    act_row = ttk.Frame(act_lf)
+    act_f = tk.Frame(frame, bg=BG)
+    act_f.pack(fill=tk.X, padx=12, pady=(14, 0))
+
+    tk.Label(act_f, text="ACTIONS", font=("Segoe UI", 7, "bold"),
+             fg=FG2, bg=BG).pack(anchor="w", pady=(0, 5))
+
+    act_row = tk.Frame(act_f, bg=BG)
     act_row.pack(anchor="w")
 
-    pause_lbl = tk.StringVar(value="▶ Resume Hotkeys" if _paused else "⏸ Pause Hotkeys")
+    pause_var = tk.StringVar(value="▶  Resume" if _paused else "⏸  Pause")
     def _toggle_pause():
         on_pause_toggle(None, None)
-        pause_lbl.set("▶ Resume Hotkeys" if _paused else "⏸ Pause Hotkeys")
-    ttk.Button(act_row, textvariable=pause_lbl, width=18, command=_toggle_pause).pack(
-        side=tk.LEFT, padx=(0, 6)
-    )
+        pause_var.set("▶  Resume" if _paused else "⏸  Pause")
+    ttk.Button(act_row, textvariable=pause_var, width=10,
+               command=_toggle_pause).pack(side=tk.LEFT, padx=(0, 6))
+
     ttk.Button(
-        act_row,
-        text="🎙 Transcribe Today",
+        act_row, text="Transcribe Today", style="Accent.TButton",
         command=lambda: threading.Thread(target=run_daily_transcription, daemon=True).start(),
     ).pack(side=tk.LEFT, padx=(0, 6))
+
+    stop_btn = ttk.Button(
+        act_row, text="⏹  Stop Recording", style="Danger.TButton",
+        command=lambda: _stop_recording_action(root),
+    )
+    stop_btn.pack(side=tk.LEFT, padx=(0, 16))
+
     startup_var = tk.BooleanVar(value=is_startup_enabled())
     def _toggle_startup():
         set_startup(startup_var.get())
-    ttk.Checkbutton(
-        act_row, text="Run on startup", variable=startup_var, command=_toggle_startup
-    ).pack(side=tk.LEFT, padx=(4, 0))
+    ttk.Checkbutton(act_row, text="Run on startup", variable=startup_var,
+                    command=_toggle_startup).pack(side=tk.LEFT)
 
-    # ── Last transcript ───────────────────────────────────────────────────────
-    lt_lf = ttk.LabelFrame(frame, text="Last Quick Transcript", padding=10)
-    lt_lf.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
-    lt_txt = tk.Text(
-        lt_lf, wrap=tk.WORD, font=("Segoe UI", 9), relief=tk.FLAT,
-        state=tk.DISABLED, fg="#1f2937", padx=4, pady=4,
-    )
-    lt_sb = ttk.Scrollbar(lt_lf, command=lt_txt.yview)
-    lt_txt.configure(yscrollcommand=lt_sb.set)
-    lt_sb.pack(side=tk.RIGHT, fill=tk.Y)
-    lt_txt.pack(fill=tk.BOTH, expand=True)
-    lt_copy_row = ttk.Frame(lt_lf)
-    lt_copy_row.pack(fill=tk.X, pady=(6, 0))
-    lt_copy_status = ttk.Label(lt_copy_row, text="", foreground="#6b7280")
-    lt_copy_status.pack(side=tk.LEFT)
+    # ── Last Transcript ───────────────────────────────────────────────────────
+    lt_f = tk.Frame(frame, bg=BG)
+    lt_f.pack(fill=tk.BOTH, expand=True, padx=12, pady=(14, 12))
+
+    lt_hdr = tk.Frame(lt_f, bg=BG)
+    lt_hdr.pack(fill=tk.X, pady=(0, 5))
+    tk.Label(lt_hdr, text="LAST TRANSCRIPT", font=("Segoe UI", 7, "bold"),
+             fg=FG2, bg=BG).pack(side=tk.LEFT)
+    lt_copy_status = tk.Label(lt_hdr, text="", fg=ACC, bg=BG, font=("Segoe UI", 8))
+    lt_copy_status.pack(side=tk.LEFT, padx=(10, 0))
     def _copy_lt():
         if last_transcript:
             pyperclip.copy(last_transcript)
-            lt_copy_status.config(text="Copied!")
+            lt_copy_status.config(text="Copied to clipboard ✓")
             root.after(2000, lambda: lt_copy_status.config(text=""))
-    ttk.Button(lt_copy_row, text="Copy to Clipboard", command=_copy_lt).pack(side=tk.RIGHT)
+    ttk.Button(lt_hdr, text="Copy", command=_copy_lt).pack(side=tk.RIGHT)
 
-    # ── Live status poll ──────────────────────────────────────────────────────
+    lt_inner = tk.Frame(lt_f, bg=BG2)
+    lt_inner.pack(fill=tk.BOTH, expand=True)
+    lt_sb = ttk.Scrollbar(lt_inner, command=None)
+    lt_txt = tk.Text(
+        lt_inner, wrap=tk.WORD, font=("Segoe UI", 9), relief=tk.FLAT,
+        state=tk.DISABLED, bg=BG2, fg=FG, insertbackground=FG,
+        padx=10, pady=8, selectbackground=ACC, selectforeground=SEL,
+        yscrollcommand=lt_sb.set,
+    )
+    lt_sb.config(command=lt_txt.yview)
+    lt_sb.pack(side=tk.RIGHT, fill=tk.Y)
+    lt_txt.pack(fill=tk.BOTH, expand=True)
+
+    # ── Visualizer draw loop ──────────────────────────────────────────────────
+    _VIZ_SCALE = 0.07   # RMS value that fills a bar (tune for sensitivity)
+    _LABEL_W   = 36     # pixels reserved for row labels on the left
+
+    def _sample_day(hist: list, live: list, n_bars: int) -> list:
+        """Merge historical (10 s/sample) + live (1 s/sample) into n_bars peaks."""
+        hist_dur = len(hist) * _WAVEFORM_HIST_STEP
+        live_dur = len(live)
+        total    = hist_dur + live_dur
+        if total == 0 or n_bars == 0:
+            return []
+        result = []
+        for i in range(n_bars):
+            t0 = total * i / n_bars
+            t1 = total * (i + 1) / n_bars
+            vals = []
+            # Hist contribution
+            h0 = int(t0 / _WAVEFORM_HIST_STEP)
+            h1 = min(int(t1 / _WAVEFORM_HIST_STEP) + 1, len(hist))
+            if h0 < len(hist):
+                vals.extend(hist[h0:h1])
+            # Live contribution
+            l0 = int(max(0.0, t0 - hist_dur))
+            l1 = min(int(t1 - hist_dur) + 1, live_dur)
+            if l0 < live_dur and t1 > hist_dur:
+                vals.extend(live[l0:l1])
+            result.append(max(vals) if vals else 0.0)
+        return result
+
+    def _draw_viz():
+        try:
+            if not root.winfo_exists():
+                return
+        except Exception:
+            return
+        W = viz_canvas.winfo_width()
+        H = viz_canvas.winfo_height()
+        if W < 20 or H < 20:
+            root.after(300, _draw_viz)
+            return
+
+        with _viz_lock:
+            live_m = list(_mic_level_history)
+            live_s = list(_sys_level_history)
+
+        hist_m = _waveform_hist_mic
+        hist_s = _waveform_hist_sys
+
+        row_h  = (H - 6) // 2    # height per channel row
+        gap_y  = 3                # gap between rows
+        mid_y  = row_h + gap_y   # y where SYS row starts
+        draw_w = W - _LABEL_W    # drawable width after label
+        n_bars = max(1, draw_w // 2)  # 2 px per bar
+
+        mic_bars = _sample_day(hist_m, live_m, n_bars)
+        sys_bars = _sample_day(hist_s, live_s, n_bars)
+
+        viz_canvas.delete("all")
+
+        # Row backgrounds
+        viz_canvas.create_rectangle(0, 0, W, row_h, fill=BG2, outline="")
+        viz_canvas.create_rectangle(0, mid_y, W, H, fill=BG2, outline="")
+
+        # Row labels + start time
+        st = _recording_start_time.strftime("%H:%M") if _recording_start_time else "--:--"
+        viz_canvas.create_text(
+            _LABEL_W // 2, row_h // 2,
+            text=f"MIC\n{st}", fill=FG2, anchor="center",
+            font=("Segoe UI", 7, "bold"), justify="center",
+        )
+        viz_canvas.create_text(
+            _LABEL_W // 2, mid_y + row_h // 2,
+            text=f"SYS\n{st}", fill=FG2, anchor="center",
+            font=("Segoe UI", 7, "bold"), justify="center",
+        )
+
+        # Draw baseline ticks
+        viz_canvas.create_line(_LABEL_W, row_h - 1, W, row_h - 1, fill=BG4, width=1)
+        viz_canvas.create_line(_LABEL_W, H - 1,    W, H - 1,    fill=BG4, width=1)
+
+        # Hour markers (vertical lines at each hour boundary in the timeline)
+        hist_dur = len(hist_m) * _WAVEFORM_HIST_STEP
+        live_dur = len(live_m)
+        total_s  = hist_dur + live_dur
+        if total_s > 0:
+            for hr in range(1, 24):
+                t_hr = hr * 3600
+                if t_hr >= total_s:
+                    break
+                x_hr = _LABEL_W + int((t_hr / total_s) * draw_w)
+                for y0, y1 in [(2, row_h - 2), (mid_y + 2, H - 2)]:
+                    viz_canvas.create_line(x_hr, y0, x_hr, y1, fill=BG4, width=1)
+
+        # Draw waveform bars
+        def draw_row(bars: list, y_base: int, rh: int, color: str, dim: str):
+            if not bars:
+                return
+            bw = max(1, draw_w // len(bars))
+            for i, lvl in enumerate(bars):
+                bh = min(int((lvl / _VIZ_SCALE) * (rh - 2)), rh - 2)
+                x0 = _LABEL_W + i * bw
+                x1 = x0 + bw - 1
+                col = color if i >= len(bars) - max(1, n_bars // 40) else dim
+                if bh > 0:
+                    viz_canvas.create_rectangle(
+                        x0, y_base + rh - 1 - bh, x1, y_base + rh - 1,
+                        fill=col, outline=""
+                    )
+
+        draw_row(mic_bars, 0,     row_h, "#4ade80", "#193d26")
+        draw_row(sys_bars, mid_y, row_h, "#60a5fa", "#162847")
+
+        # "NOW ▶" label at right edge
+        if mic_bars or sys_bars:
+            viz_canvas.create_text(
+                W - 2, row_h // 2,
+                text="now", fill=FG2, anchor="e",
+                font=("Segoe UI", 6),
+            )
+
+        root.after(1000, _draw_viz)   # full-day view only needs 1 Hz refresh
+
+    viz_canvas.bind("<Map>", lambda _: root.after(500, _draw_viz))
+
+    # ── Status & transcript poll loop ─────────────────────────────────────────
     def _refresh():
         try:
             if not root.winfo_exists():
                 return
         except Exception:
             return
+
+        # Status dot + label
         if _paused:
-            dot.config(fg="#6b7280")
+            dot.config(fg=BG4)
             status_txt.config(text="Paused")
+            info_txt.config(text="Hotkeys disabled")
         elif _transcribing:
-            dot.config(fg="#eab308")
+            dot.config(fg=YEL)
             status_txt.config(text="Transcribing…")
+            info_txt.config(text="")
+        elif daily_recorder:
+            dot.config(fg=GRN)
+            status_txt.config(text="Recording")
+            info_txt.config(text="Daily audio capture active")
         else:
-            dot.config(fg="#22c55e")
-            status_txt.config(text="Recording daily" if config.get("daily_recording") else "Ready")
+            dot.config(fg=BG4 if not config.get("daily_recording") else FG2)
+            status_txt.config(text="Ready")
+            info_txt.config(text="")
+
+        # Stop button state
+        try:
+            stop_btn.state(["!disabled"] if daily_recorder else ["disabled"])
+        except Exception:
+            pass
+
+        # Pause button label
+        pause_var.set("▶  Resume" if _paused else "⏸  Pause")
+
+        # Today's recording stats (status bar right side)
         rec_path = Path(config.get("recording_path", "recordings"))
-        mic_f = rec_path / date.today().isoformat() / "mic.raw"
-        info_txt.config(
-            text=f"Today's recording: {mic_f.stat().st_size / 1024 / 1024:.1f} MB"
-            if mic_f.exists() else ""
-        )
+        mic_f    = rec_path / date.today().isoformat() / "mic.raw"
+        if mic_f.exists():
+            mb  = mic_f.stat().st_size / 1024 / 1024
+            st  = _recording_start_time
+            if st:
+                dur = datetime.now() - st
+                h  = int(dur.total_seconds()) // 3600
+                mn = (int(dur.total_seconds()) % 3600) // 60
+                today_lbl.config(text=f"{st.strftime('%H:%M')} → now  •  {mb:.0f} MB")
+            else:
+                today_lbl.config(text=f"{mb:.0f} MB today")
+        else:
+            today_lbl.config(text="")
+
+        # Last transcript text
         lt_txt.configure(state=tk.NORMAL)
         lt_txt.delete("1.0", tk.END)
         lt_txt.insert(
             tk.END,
-            last_transcript or "(No transcription yet — use a hotkey or click a button above)",
+            last_transcript or "No transcription yet — press a hotkey or click a button above",
         )
         lt_txt.configure(state=tk.DISABLED)
+
         root.after(1000, _refresh)
 
     _refresh()
@@ -1233,9 +1733,17 @@ def _build_history_tab(frame, root):
     import tkinter as tk
     from tkinter import ttk
 
+    BG  = _D["BG"]
+    BG2 = _D["BG2"]
+    BG3 = _D["BG3"]
+    FG  = _D["FG"]
+    FG2 = _D["FG2"]
+    ACC = _D["ACCENT"]
+    SEL = _D["SEL_FG"]
+
     # Vertical split: top = list, bottom = full text viewer
     paned = tk.PanedWindow(frame, orient=tk.VERTICAL, sashwidth=5,
-                           sashrelief=tk.FLAT, bg="#e5e7eb")
+                           sashrelief=tk.FLAT, bg=_D["BG4"])
     paned.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
 
     # ── Top: history list ─────────────────────────────────────────────────────
@@ -1262,7 +1770,7 @@ def _build_history_tab(frame, root):
 
     top_bot = ttk.Frame(top_f)
     top_bot.pack(fill=tk.X, padx=10, pady=(0, 4))
-    list_status = ttk.Label(top_bot, text="Select a row to view", foreground="#6b7280")
+    list_status = ttk.Label(top_bot, text="Select a row to view", foreground=_D["FG2"])
     list_status.pack(side=tk.LEFT)
     texts: dict[str, str] = {}
 
@@ -1293,10 +1801,9 @@ def _build_history_tab(frame, root):
 
     view_header = ttk.Frame(bot_f)
     view_header.pack(fill=tk.X, padx=10, pady=(6, 2))
-    view_title = ttk.Label(view_header, text="Transcript", font=("Segoe UI", 9, "bold"),
-                           foreground="#374151")
+    view_title = ttk.Label(view_header, text="Transcript", font=("Segoe UI", 9, "bold"))
     view_title.pack(side=tk.LEFT)
-    copy_status = ttk.Label(view_header, text="", foreground="#6b7280")
+    copy_status = ttk.Label(view_header, text="")
     copy_status.pack(side=tk.LEFT, padx=(10, 0))
 
     txt_f = ttk.Frame(bot_f)
@@ -1304,8 +1811,9 @@ def _build_history_tab(frame, root):
 
     view_txt = tk.Text(
         txt_f, wrap=tk.WORD, font=("Segoe UI", 9), relief=tk.FLAT,
-        state=tk.DISABLED, fg="#1f2937", padx=6, pady=6, spacing3=2,
-        bg="#fafafa",
+        state=tk.DISABLED, bg=BG2, fg=FG, padx=8, pady=6, spacing3=2,
+        selectbackground=ACC, selectforeground=SEL,
+        insertbackground=FG,
     )
     view_sb = ttk.Scrollbar(txt_f, command=view_txt.yview)
     view_txt.configure(yscrollcommand=view_sb.set)
@@ -1313,8 +1821,8 @@ def _build_history_tab(frame, root):
     view_txt.pack(fill=tk.BOTH, expand=True)
 
     # Tags for timestamp formatting
-    view_txt.tag_configure("ts",   foreground="#9ca3af", font=("Segoe UI", 8))
-    view_txt.tag_configure("body", font=("Segoe UI", 9))
+    view_txt.tag_configure("ts",   foreground=FG2, font=("Segoe UI", 8))
+    view_txt.tag_configure("body", font=("Segoe UI", 9), foreground=FG)
 
     def _copy_current():
         sel = tree.selection()
@@ -1357,8 +1865,16 @@ def _build_transcripts_tab(frame, root):
     import tkinter as tk
     from tkinter import ttk
 
+    BG  = _D["BG"]
+    BG2 = _D["BG2"]
+    BG3 = _D["BG3"]
+    FG  = _D["FG"]
+    FG2 = _D["FG2"]
+    ACC = _D["ACCENT"]
+    SEL = _D["SEL_FG"]
+
     paned = tk.PanedWindow(
-        frame, orient=tk.HORIZONTAL, sashwidth=5, sashrelief=tk.FLAT, bg="#e5e7eb"
+        frame, orient=tk.HORIZONTAL, sashwidth=5, sashrelief=tk.FLAT, bg=_D["BG4"]
     )
     paned.pack(fill=tk.BOTH, expand=True)
 
@@ -1370,7 +1886,8 @@ def _build_transcripts_tab(frame, root):
     )
     date_lb = tk.Listbox(
         left, activestyle="dotbox", selectmode=tk.SINGLE, font=("Segoe UI", 9),
-        relief=tk.FLAT, selectbackground="#3b82f6", selectforeground="white",
+        relief=tk.FLAT, bg=BG2, fg=FG,
+        selectbackground=ACC, selectforeground=SEL,
         exportselection=False,
     )
     date_scroll = ttk.Scrollbar(left, command=date_lb.yview)
@@ -1402,23 +1919,25 @@ def _build_transcripts_tab(frame, root):
     txt_frame.pack(fill=tk.BOTH, expand=True, padx=8)
     txt = tk.Text(
         txt_frame, wrap=tk.WORD, font=("Segoe UI", 9), relief=tk.FLAT,
-        state=tk.DISABLED, cursor="arrow", padx=6, pady=4, spacing1=1, spacing3=2,
+        state=tk.DISABLED, cursor="arrow", bg=BG2, fg=FG,
+        padx=8, pady=4, spacing1=1, spacing3=2,
+        selectbackground=ACC, selectforeground=SEL,
     )
     txt_sb = ttk.Scrollbar(txt_frame, command=txt.yview)
     txt.configure(yscrollcommand=txt_sb.set)
     txt_sb.pack(side=tk.RIGHT, fill=tk.Y)
     txt.pack(fill=tk.BOTH, expand=True)
-    txt.tag_configure("you",      foreground="#2563eb", font=("Segoe UI", 9, "bold"))
-    txt.tag_configure("discord",  foreground="#059669", font=("Segoe UI", 9, "bold"))
-    txt.tag_configure("ts",       foreground="#9ca3af", font=("Segoe UI", 8))
-    txt.tag_configure("body",     font=("Segoe UI", 9))
-    txt.tag_configure("search",   background="#fef08a")
-    txt.tag_configure("selected", background="#dbeafe")
+    txt.tag_configure("you",      foreground="#7aa2f7", font=("Segoe UI", 9, "bold"))
+    txt.tag_configure("discord",  foreground="#9ece6a", font=("Segoe UI", 9, "bold"))
+    txt.tag_configure("ts",       foreground=FG2, font=("Segoe UI", 8))
+    txt.tag_configure("body",     font=("Segoe UI", 9), foreground=FG)
+    txt.tag_configure("search",   background="#e0af68", foreground="#1a1b26")
+    txt.tag_configure("selected", background="#2f334d")
 
     bot = ttk.Frame(right)
     bot.pack(fill=tk.X, padx=8, pady=(4, 8))
     status_var = tk.StringVar(value="Select a date")
-    ttk.Label(bot, textvariable=status_var, foreground="gray").pack(side=tk.LEFT)
+    ttk.Label(bot, textvariable=status_var).pack(side=tk.LEFT)
 
     _current_segments: list[dict] = []
 
@@ -1536,7 +2055,7 @@ def _build_transcripts_tab(frame, root):
         for d in dates:
             date_lb.insert(tk.END, d)
             if not (rec_path / d / "transcript.json").exists():
-                date_lb.itemconfig(tk.END, foreground="#9ca3af")
+                date_lb.itemconfig(tk.END, foreground=_D["FG2"])
         if dates:
             date_lb.selection_set(0)
             date_lb.event_generate("<<ListboxSelect>>")
@@ -1549,8 +2068,10 @@ def _build_settings_tab(frame, root):
     import tkinter as tk
     from tkinter import ttk
 
+    BG = _D["BG"]
+
     # Scrollable canvas wrapper
-    canvas = tk.Canvas(frame, highlightthickness=0)
+    canvas = tk.Canvas(frame, highlightthickness=0, bg=BG)
     vsb    = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
     canvas.configure(yscrollcommand=vsb.set)
     vsb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1610,7 +2131,7 @@ def _build_settings_tab(frame, root):
                  state="readonly", width=55).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def _hint(text: str):
-        ttk.Label(inner, text=text, foreground="#9ca3af", font=("Segoe UI", 8)).pack(
+        ttk.Label(inner, text=text, foreground=_D["FG2"], font=("Segoe UI", 8)).pack(
             anchor="w", padx=14, pady=(0, 6)
         )
 
@@ -1689,7 +2210,7 @@ def _build_settings_tab(frame, root):
 
     ttk.Separator(inner, orient="horizontal").pack(fill=tk.X, padx=14, pady=(8, 6))
     status_var = tk.StringVar(value="")
-    ttk.Label(inner, textvariable=status_var, foreground="#6b7280").pack(anchor="w", padx=14)
+    ttk.Label(inner, textvariable=status_var).pack(anchor="w", padx=14)
     btn_r = ttk.Frame(inner)
     btn_r.pack(anchor="e", padx=14, pady=(4, 14))
 
@@ -1716,6 +2237,71 @@ def _build_settings_tab(frame, root):
         log.info("Settings saved via panel")
 
     ttk.Button(btn_r, text="Save Settings", command=_save).pack(side=tk.RIGHT)
+
+
+# ─── Tab Icons ────────────────────────────────────────────────────────────────
+
+def _make_tab_icons(size: int = 16) -> dict:
+    """Create small PIL-based PhotoImages for notebook tabs. Returns {name: PhotoImage}."""
+    import math
+    from PIL import Image, ImageDraw
+    from PIL import ImageTk as _ItkCls
+
+    DIM  = _D["FG2"]   # icon colour (muted)
+    BG   = _D["BG2"]   # icon background (transparent anyway)
+    icons = {}
+
+    def _new():
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        return img, ImageDraw.Draw(img)
+
+    # ── Dashboard: 5 waveform bars ────────────────────────────────────────────
+    img, d = _new()
+    heights = [5, 9, 13, 8, 4]
+    bw = max(1, size // (len(heights) * 2))
+    gap = bw
+    total = len(heights) * (bw + gap) - gap
+    x = (size - total) // 2
+    for h in heights:
+        d.rectangle([x, size - 2 - h, x + bw, size - 2], fill=DIM)
+        x += bw + gap
+    icons["dashboard"] = _ItkCls.PhotoImage(img)
+
+    # ── History: clock face ───────────────────────────────────────────────────
+    img, d = _new()
+    r = size // 2 - 2
+    cx = cy = size // 2
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=DIM, width=1)
+    d.line([cx, cy, cx, cy - r + 3], fill=DIM, width=1)      # 12 o'clock hand
+    d.line([cx, cy, cx + r - 3, cy + 2], fill=DIM, width=1)  # 3 o'clock hand
+    icons["history"] = _ItkCls.PhotoImage(img)
+
+    # ── Transcripts: stacked text lines ──────────────────────────────────────
+    img, d = _new()
+    y = 3
+    for i in range(5):
+        lw = size - 4 if i % 2 == 0 else size - 7
+        d.line([2, y, 2 + lw, y], fill=DIM, width=1)
+        y += 3
+    icons["transcripts"] = _ItkCls.PhotoImage(img)
+
+    # ── Settings: gear wheel ─────────────────────────────────────────────────
+    img, d = _new()
+    cr = size // 2 - 4
+    cx = cy = size // 2
+    d.ellipse([cx - cr, cy - cr, cx + cr, cy + cr], outline=DIM, width=1)
+    d.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=DIM)
+    tooth = cr + 2
+    for angle in range(0, 360, 45):
+        rad = math.radians(angle)
+        x1 = cx + int(cr * math.cos(rad))
+        y1 = cy + int(cr * math.sin(rad))
+        x2 = cx + int(tooth * math.cos(rad))
+        y2 = cy + int(tooth * math.sin(rad))
+        d.line([x1, y1, x2, y2], fill=DIM, width=2)
+    icons["settings"] = _ItkCls.PhotoImage(img)
+
+    return icons
 
 
 # ─── Main Control Panel ───────────────────────────────────────────────────────
@@ -1751,10 +2337,8 @@ def open_main_panel(start_tab: int = 0):
             root.title("Pascribe")
             root.geometry("1020x680")
             root.minsize(720, 500)
-            try:
-                ttk.Style().theme_use("vista")
-            except Exception:
-                pass
+            root.configure(bg=_D["BG"])
+            _apply_dark_theme(root)
 
             # Set window icon using the same waveform image
             try:
@@ -1772,11 +2356,11 @@ def open_main_panel(start_tab: int = 0):
             ttk.Separator(footer, orient="horizontal").pack(fill=tk.X)
             footer_inner = ttk.Frame(footer)
             footer_inner.pack(fill=tk.X, padx=10, pady=3)
-            _ver_lbl = ttk.Label(footer_inner, text="Pascribe v0.5",
-                                 foreground="#9ca3af", font=("Segoe UI", 8))
+            _ver_lbl = ttk.Label(footer_inner, text="Pascribe v0.5.3",
+                                 foreground=_D["FG2"], font=("Segoe UI", 8))
             _ver_lbl.pack(side=tk.LEFT)
-            _footer_status = ttk.Label(footer_inner, text="", foreground="#6b7280",
-                                       font=("Segoe UI", 8))
+            _footer_status = ttk.Label(footer_inner, text="",
+                                       foreground=_D["FG2"], font=("Segoe UI", 8))
             _footer_status.pack(side=tk.RIGHT)
 
             def _update_footer():
@@ -1801,17 +2385,28 @@ def open_main_panel(start_tab: int = 0):
             _update_footer()
 
             nb = ttk.Notebook(root)
-            nb.pack(fill=tk.BOTH, expand=True)
+            nb.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
             _main_panel_notebook = nb
 
-            for title, builder in [
-                ("  Dashboard  ",         _build_dashboard_tab),
-                ("  History  ",           _build_history_tab),
-                ("  Daily Transcripts  ", _build_transcripts_tab),
-                ("  Settings  ",          _build_settings_tab),
+            # Build tab icons (keep refs on root to prevent GC)
+            try:
+                _tab_icons = _make_tab_icons(size=16)
+                root._tab_icons = _tab_icons   # prevent garbage collection
+            except Exception:
+                _tab_icons = {}
+
+            for title, builder, icon_key in [
+                ("  Dashboard  ",        _build_dashboard_tab,   "dashboard"),
+                ("  History  ",          _build_history_tab,     "history"),
+                ("  Daily Transcripts  ",_build_transcripts_tab, "transcripts"),
+                ("  Settings  ",         _build_settings_tab,    "settings"),
             ]:
                 f = ttk.Frame(nb)
-                nb.add(f, text=title)
+                icon = _tab_icons.get(icon_key)
+                if icon:
+                    nb.add(f, text=title, image=icon, compound="left")
+                else:
+                    nb.add(f, text=title)
                 builder(f, root)
 
             nb.select(min(start_tab, 3))
@@ -1943,7 +2538,7 @@ def setup_tray():
     menu = Menu(
         MenuItem("Open Panel…", lambda icon, item: open_main_panel(), default=True),
         Menu.SEPARATOR,
-        MenuItem("Pascribe v0.5", lambda: None, enabled=False),
+        MenuItem("Pascribe v0.5.3", lambda: None, enabled=False),
         MenuItem(daily_label, lambda: None, enabled=False),
         Menu.SEPARATOR,
         MenuItem("Settings…",              lambda icon, item: open_settings()),
@@ -1986,7 +2581,7 @@ def main():
         log.warning("Pascribe is already running — exiting duplicate")
         sys.exit(0)
 
-    log.info("Pascribe v0.5 starting")
+    log.info("Pascribe v0.5.3 starting")
 
     # Start audio capture — app continues even if no streams start
     streams = start_audio_streams()
