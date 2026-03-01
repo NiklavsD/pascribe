@@ -902,9 +902,14 @@ def post_to_homelab(data: dict, url: str):
     """POST transcript JSON to homelab server."""
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        url, data=body, headers={"content-type": "application/json"}, method="POST"
+        url, data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Pascribe/0.5.3",
+        },
+        method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with urllib.request.urlopen(req, timeout=60) as r:
         log.info(f"Homelab response: {r.status}")
 
 # ─── Daily Transcription ──────────────────────────────────────────────────────
