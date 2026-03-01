@@ -659,13 +659,12 @@ def _load_day_waveform_bg():
     )
 
 
-def load_todays_recordings() -> tuple[np.ndarray | None, np.ndarray | None, datetime | None, int]:
-    """Load today's mic and system audio from disk.
+def load_todays_recordings(for_date: str | None = None) -> tuple[np.ndarray | None, np.ndarray | None, datetime | None, int]:
+    """Load mic and system audio from disk for a given date (default: today).
     Returns (mic_audio, sys_audio, start_time, sample_rate).
     """
     rec_path = Path(config.get("recording_path", "recordings"))
-    today = date.today().isoformat()
-    day_dir = rec_path / today
+    day_dir = rec_path / (for_date or date.today().isoformat())
 
     if not day_dir.exists():
         return None, None, None, 16000
@@ -838,7 +837,11 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
         raise RuntimeError(f"AssemblyAI upload {e.code}: {body[:400]}")
 
     # 2. Submit transcription job
-    body = json.dumps({"audio_url": upload_url, "language_detection": True}).encode()
+    body = json.dumps({
+        "audio_url": upload_url,
+        "language_detection": True,
+        "speech_models": ["universal-3-pro"],
+    }).encode()
     req = urllib.request.Request(
         f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
     )
@@ -906,20 +909,21 @@ def post_to_homelab(data: dict, url: str):
 
 # ─── Daily Transcription ──────────────────────────────────────────────────────
 
-def run_daily_transcription():
+def run_daily_transcription(for_date: str | None = None):
     """Trigger daily transcription in a background thread (called from tray)."""
-    threading.Thread(target=_daily_transcription_worker, daemon=True).start()
+    threading.Thread(target=_daily_transcription_worker, args=(for_date,), daemon=True).start()
 
 
-def _daily_transcription_worker():
+def _daily_transcription_worker(for_date: str | None = None):
+    target_date = for_date or date.today().isoformat()
     try:
         update_tray_icon("yellow")
-        notify("Loading today's recordings...")
+        notify(f"Loading recordings for {target_date}...")
 
-        mic_audio, sys_audio, started, sample_rate = load_todays_recordings()
+        mic_audio, sys_audio, started, sample_rate = load_todays_recordings(target_date)
 
         if mic_audio is None and sys_audio is None:
-            notify("No recordings found — enable Daily Recording in Settings")
+            notify(f"No recordings found for {target_date}")
             update_tray_icon("green")
             return
 
@@ -941,7 +945,7 @@ def _daily_transcription_worker():
         vad_segs = _energy_vad(mix, sample_rate)
 
         if not vad_segs:
-            notify("No speech detected in today's recordings")
+            notify(f"No speech detected in {target_date} recordings")
             update_tray_icon("green")
             return
 
@@ -998,7 +1002,7 @@ def _daily_transcription_worker():
         log.info(f"Daily transcript: {word_count} words, {len(raw_segs)} segments")
 
         payload = {
-            "date": date.today().isoformat(),
+            "date": target_date,
             "recorded_from": started.isoformat(),
             "duration_minutes": round(duration_s / 60, 1),
             "speech_minutes": round(total_speech_s / 60, 1),
@@ -1011,7 +1015,7 @@ def _daily_transcription_worker():
 
         # Save local copy alongside the raw audio
         rec_path = Path(config.get("recording_path", "recordings"))
-        day_dir = rec_path / date.today().isoformat()
+        day_dir = rec_path / target_date
         out_path = day_dir / "transcript.json"
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -1233,7 +1237,7 @@ def notify(message: str, sound: str = ""):
     Balloon popups are intentionally skipped to avoid the Windows system ding.
     """
     if tray_icon:
-        tray_icon.title = f"Pascribe — {message}"
+        tray_icon.title = f"Pascribe — {message}"[:127]
     if sound:
         _play_sound(sound)
 
@@ -1953,6 +1957,37 @@ def _build_transcripts_tab(frame, root):
         status_var.set(f"Copied {len(segs)} segments")
         root.after(2000, lambda: status_var.set(f"{len(_current_segments)} segments"))
 
+    def _send_to_homelab():
+        homelab_url = config.get("homelab_url")
+        if not homelab_url:
+            status_var.set("No homelab_url in settings")
+            return
+        sel = date_lb.curselection()
+        if not sel:
+            return
+        chosen = date_lb.get(sel[0])
+        rec_path = Path(config.get("recording_path", "recordings"))
+        tf = rec_path / chosen / "transcript.json"
+        if not tf.exists():
+            status_var.set("No transcript to send")
+            return
+        status_var.set(f"Sending {chosen}...")
+
+        def _do_send():
+            try:
+                with open(tf, encoding="utf-8") as f:
+                    payload = json.load(f)
+                post_to_homelab(payload, homelab_url)
+                root.after(0, lambda: status_var.set(f"Sent {chosen} to homelab"))
+            except Exception as e:
+                log.error(f"Homelab send failed: {e}")
+                root.after(0, lambda: status_var.set(f"Send failed: {e}"))
+
+        threading.Thread(target=_do_send, daemon=True).start()
+
+    homelab_btn = ttk.Button(bot, text="Send to Homelab", style="Accent.TButton",
+                             command=_send_to_homelab)
+    homelab_btn.pack(side=tk.RIGHT, padx=(4, 0))
     ttk.Button(bot, text="Copy All",     command=lambda: _copy_filtered("all")    ).pack(side=tk.RIGHT, padx=(4, 0))
     ttk.Button(bot, text="Copy Discord", command=lambda: _copy_filtered("discord")).pack(side=tk.RIGHT, padx=(4, 0))
     ttk.Button(bot, text="Copy You",     command=lambda: _copy_filtered("you")    ).pack(side=tk.RIGHT, padx=(4, 0))
@@ -2013,8 +2048,55 @@ def _build_transcripts_tab(frame, root):
 
     txt.bind("<Button-1>", _click_copy)
 
+    # "Transcribe this date" button — shown when a date has raw audio but no transcript
+    transcribe_btn_frame = tk.Frame(right, bg=_D["BG"])
+    _transcribe_btn_visible = [False]
+
+    def _show_transcribe_btn(chosen_date: str):
+        if _transcribe_btn_visible[0]:
+            return
+        for w in transcribe_btn_frame.winfo_children():
+            w.destroy()
+        rec_path = Path(config.get("recording_path", "recordings"))
+        day_dir = rec_path / chosen_date
+        mic_f = day_dir / "mic.raw"
+        sys_f = day_dir / "sys.raw"
+        if not mic_f.exists() and not sys_f.exists():
+            return
+        total_mb = sum(f.stat().st_size for f in (mic_f, sys_f) if f.exists()) / 1024 / 1024
+        # Estimate duration from mic file size + meta
+        meta_f = day_dir / "meta.json"
+        dur_str = ""
+        if meta_f.exists():
+            with open(meta_f) as mf:
+                meta = json.load(mf)
+            sr = meta.get("sample_rate", 16000)
+            bps = 4 if meta.get("dtype", "float32") == "float32" else 2
+            hours = mic_f.stat().st_size / bps / sr / 3600 if mic_f.exists() else 0
+            dur_str = f" — ~{hours:.1f}h"
+        tk.Label(transcribe_btn_frame,
+                 text=f"Raw audio: {total_mb:.0f} MB (mic + sys{dur_str}). No transcript yet.",
+                 fg=_D["FG2"], bg=_D["BG"], font=("Segoe UI", 9)).pack(pady=(4, 4))
+        ttk.Button(
+            transcribe_btn_frame, text=f"Transcribe {chosen_date}",
+            style="Accent.TButton",
+            command=lambda d=chosen_date: _do_transcribe(d),
+        ).pack(pady=(0, 4))
+        transcribe_btn_frame.pack(fill=tk.X, padx=8, before=bot)
+        _transcribe_btn_visible[0] = True
+
+    def _hide_transcribe_btn():
+        transcribe_btn_frame.pack_forget()
+        _transcribe_btn_visible[0] = False
+
+    def _do_transcribe(chosen_date: str):
+        _hide_transcribe_btn()
+        status_var.set(f"Transcribing {chosen_date}...")
+        run_daily_transcription(chosen_date)
+
     def _load_date(_event=None):
         nonlocal _current_segments
+        _hide_transcribe_btn()
         sel = date_lb.curselection()
         if not sel:
             return
@@ -2024,14 +2106,11 @@ def _build_transcripts_tab(frame, root):
         if not tf.exists():
             txt.configure(state=tk.NORMAL)
             txt.delete("1.0", tk.END)
-            txt.insert(
-                tk.END,
-                "No transcript yet for this date.\n"
-                "Use 'Transcribe Today' in the Dashboard tab.",
-            )
+            txt.insert(tk.END, "No transcript for this date.\n", "body")
             txt.configure(state=tk.DISABLED)
             status_var.set("No transcript")
             _current_segments = []
+            _show_transcribe_btn(chosen)
             return
         with open(tf, encoding="utf-8") as f:
             data = json.load(f)
