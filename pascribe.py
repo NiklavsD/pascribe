@@ -1147,6 +1147,32 @@ def _on_transcribe_inner(minutes: int):
             update_tray_icon("green")
             notify(f"{word_count:,} words copied  ({elapsed:.1f}s)", sound="success")
             add_history_entry(minutes, word_count, elapsed, transcript)
+            # Send to homelab if configured
+            homelab_url = config.get("homelab_url")
+            if homelab_url:
+                now = datetime.now()
+                payload = {
+                    "type": "quick",
+                    "date": date.today().isoformat(),
+                    "recorded_from": (now - timedelta(minutes=minutes)).isoformat(),
+                    "duration_minutes": round(minutes, 1),
+                    "speech_minutes": round(elapsed / 60, 1),
+                    "word_count": word_count,
+                    "segments": [
+                        {
+                            "time": (now - timedelta(minutes=minutes) + timedelta(seconds=s)).strftime("%H:%M:%S"),
+                            "speaker": "you",
+                            "text": t,
+                        }
+                        for s, _e, t in segments
+                    ],
+                }
+                def _send(p=payload, u=homelab_url):
+                    try:
+                        post_to_homelab(p, u)
+                    except Exception as e:
+                        log.error(f"Homelab quick-send failed: {e}")
+                threading.Thread(target=_send, daemon=True).start()
         else:
             log.info("No speech detected")
             update_tray_icon("green")
@@ -1842,6 +1868,60 @@ def _build_history_tab(frame, root):
                 copy_status.config(text="Copied!")
                 root.after(2000, lambda: copy_status.config(text=""))
 
+    def _send_current_to_homelab():
+        homelab_url = config.get("homelab_url")
+        if not homelab_url:
+            copy_status.config(text="No homelab_url configured")
+            root.after(2000, lambda: copy_status.config(text=""))
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        full_text = texts.get(sel[0], "")
+        if not full_text:
+            return
+        vals = tree.item(sel[0], "values")  # (time_str, "N min", words, preview)
+        copy_status.config(text="Sending...")
+        mins_str = vals[1].replace(" min", "")
+        mins_val = int(mins_str) if mins_str.isdigit() else 0
+        words_val = int(vals[2]) if str(vals[2]).isdigit() else 0
+        # Parse lines into segments
+        segs = []
+        for line in full_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("[") and "]" in line:
+                bracket_end = line.index("]") + 1
+                ts = line[1:bracket_end - 1]
+                body = line[bracket_end:].strip()
+            else:
+                ts = "00:00:00"
+                body = line
+            if body:
+                segs.append({"time": ts, "speaker": "you", "text": body})
+        payload = {
+            "type": "quick",
+            "date": vals[0][:10] if len(vals[0]) >= 10 else date.today().isoformat(),
+            "recorded_from": vals[0],
+            "duration_minutes": float(mins_val),
+            "speech_minutes": float(mins_val),
+            "word_count": words_val,
+            "segments": segs,
+        }
+        def _do():
+            try:
+                post_to_homelab(payload, homelab_url)
+                root.after(0, lambda: copy_status.config(text="Sent to homelab"))
+                root.after(2000, lambda: copy_status.config(text=""))
+            except Exception as e:
+                log.error(f"Homelab send failed: {e}")
+                root.after(0, lambda: copy_status.config(text=f"Send failed"))
+                root.after(3000, lambda: copy_status.config(text=""))
+        threading.Thread(target=_do, daemon=True).start()
+
+    ttk.Button(view_header, text="Send to Homelab", style="Accent.TButton",
+               command=_send_current_to_homelab).pack(side=tk.RIGHT, padx=(4, 0))
     ttk.Button(view_header, text="Copy", command=_copy_current).pack(side=tk.RIGHT)
 
     def on_select(_event):
