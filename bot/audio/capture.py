@@ -21,7 +21,6 @@ from config import MIN_SPEECH_DURATION, SAMPLE_RATE, PCM_SAMPLE_WIDTH
 
 if TYPE_CHECKING:
     import discord
-    from commands.voice import VoiceCommandDetector
 
 log = logging.getLogger(__name__)
 
@@ -111,10 +110,12 @@ class UserAudioSink:
     def __init__(
         self,
         bot: discord.Client,
-        voice_detector: VoiceCommandDetector | None = None,
+        stream_transcriber=None,
+        wake_detector=None,
     ):
         self.bot = bot
-        self.voice_detector = voice_detector
+        self._stream_transcriber = stream_transcriber
+        self._wake_detector = wake_detector
 
         # SSRC → user_id mapping (populated from SPEAKING events via hook)
         self._ssrc_to_user: dict[int, int] = {}
@@ -124,7 +125,6 @@ class UserAudioSink:
         self._ssrc_states: dict[int, _SSRCState] = {}
 
         # Accumulated data
-        self._raw_buffers: dict[int, bytearray] = {}
         self._speech_segments: dict[int, list[bytes]] = {}
         self._excluded_users: set[int] = set()
 
@@ -403,10 +403,31 @@ class UserAudioSink:
 
         username = self._resolve_username(user_id)
 
-        # Accumulate raw audio
-        if user_id not in self._raw_buffers:
-            self._raw_buffers[user_id] = bytearray()
-        self._raw_buffers[user_id].extend(pcm_stereo)
+        # Feed to per-user streaming transcriber (mono 48kHz → will be downsampled to 16kHz)
+        if self._stream_transcriber:
+            from audio.vad import stereo_to_mono
+            mono_pcm = stereo_to_mono(pcm_stereo)
+            # Register user stream on first packet if not yet known
+            if not self._stream_transcriber.has_user(user_id):
+                import asyncio
+                try:
+                    loop = self.bot.loop
+                    asyncio.run_coroutine_threadsafe(
+                        self._stream_transcriber.add_user(user_id, username), loop
+                    )
+                except Exception as e:
+                    log.warning("Failed to create stream for user %s: %s", username, e)
+            self._stream_transcriber.feed_audio(user_id, mono_pcm)
+
+        # Feed to local Vosk wake word detector (mono 48kHz)
+        if self._wake_detector:
+            if self._stream_transcriber:
+                vosk_mono = mono_pcm  # already computed above
+            else:
+                from audio.vad import stereo_to_mono
+                vosk_mono = stereo_to_mono(pcm_stereo)
+            self._wake_detector.add_user(user_id, username)
+            self._wake_detector.feed_audio(user_id, vosk_mono)
 
         # VAD
         segments = state.segmenter.process_chunk(pcm_stereo)
@@ -450,15 +471,8 @@ class UserAudioSink:
             self._listening = False
 
     def flush_raw_audio(self) -> dict[str, list]:
-        results: dict[str, list] = {}
-        for user_id, buf in self._raw_buffers.items():
-            if not buf:
-                continue
-            username = self._user_names.get(user_id, str(user_id))
-            path = save_pcm_as_wav(bytes(buf), username, label="raw")
-            results.setdefault(username, []).append(path)
-        self._raw_buffers.clear()
-        return results
+        # No-op - raw audio collection has been disabled
+        return {}
 
     def get_speech_segments(self, user_id: int | None = None) -> dict[int, list[bytes]]:
         if user_id is not None:
@@ -488,7 +502,6 @@ class UserAudioSink:
                     sample_width=PCM_SAMPLE_WIDTH,
                 )
 
-        self.flush_raw_audio()
         self._ssrc_states.clear()
         self._ssrc_to_user.clear()
         self._speech_segments.clear()

@@ -13,21 +13,27 @@ import logging
 import signal
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import discord
 from discord.ext import commands, tasks
 
 from audio.capture import UserAudioSink
 from commands.slash import PascribeCog
-from commands.voice import VoiceCommandDetector
 from config import (
     BLACKLIST_CHANNELS,
     DISCORD_TOKEN,
     GUILD_ID,
+    RECORDINGS_DIR,
     REPORT_CHANNEL_ID,
     INACTIVITY_THRESHOLD_S,
+    OPENROUTER_API_KEY,
 )
 from transcription.pipeline import generate_daily_report
+from transcription.streaming import PerUserStreamManager
+from triggers import check_cooldown, mark_triggered, build_trigger_snippet, write_trigger_file
+from wakeword import LocalWakeWordDetector
+import analysis
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -51,7 +57,10 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 audio_sink: UserAudioSink | None = None
+stream_transcriber: PerUserStreamManager | None = None
+wake_detector: LocalWakeWordDetector | None = None
 _joining: bool = False
+_main_loop: asyncio.AbstractEventLoop | None = None
 
 # Track when someone was last in VC (for inactivity-based report)
 _last_vc_activity: datetime | None = None
@@ -140,11 +149,150 @@ async def _resume_user(user_id: int) -> None:
         audio_sink.include_user(user_id)
 
 
-voice_detector = VoiceCommandDetector(
-    on_trigger=_trigger_processing,
-    on_pause=_pause_user,
-    on_resume=_resume_user,
-)
+COOLDOWN_CHIME_PATH = Path(__file__).parent / "assets" / "cooldown_chime.wav"
+
+async def _play_cooldown_chime() -> None:
+    """Play a short low-volume descending chime to signal cooldown denial."""
+    guild = bot.get_guild(GUILD_ID)
+    if not guild or not guild.voice_client or not guild.voice_client.is_connected():
+        return
+    vc = guild.voice_client
+    if vc.is_playing():
+        return  # don't interrupt active audio
+    try:
+        source = discord.FFmpegPCMAudio(str(COOLDOWN_CHIME_PATH))
+        source = discord.PCMVolumeTransformer(source, volume=0.15)
+        vc.play(source)
+    except Exception:
+        pass
+
+
+def _vosk_wake_callback(user_id: int, username: str, text: str) -> None:
+    """Called from audio thread when Vosk detects 'benjamin'. Bridge to async."""
+    if not _main_loop:
+        return
+    if not check_cooldown(user_id):
+        asyncio.run_coroutine_threadsafe(_play_cooldown_chime(), _main_loop)
+        return
+    mark_triggered(user_id)
+    log.info("🔊 VOSK TRIGGER by %s: %s", username, text)
+    asyncio.run_coroutine_threadsafe(_vosk_trigger_async(user_id, username, text), _main_loop)
+
+
+async def _vosk_trigger_async(user_id: int, username: str, text: str) -> None:
+    """Async handler for Vosk wake word detection."""
+    try:
+        from config import RECORDINGS_DIR
+        await _play_trigger_chime()
+        
+        # Get VC members
+        vc_user_ids = {}
+        guild = bot.get_guild(GUILD_ID)
+        if guild and guild.voice_client and guild.voice_client.channel:
+            for m in guild.voice_client.channel.members:
+                if not m.bot:
+                    vc_user_ids[m.id] = m.display_name
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        daily_path = RECORDINGS_DIR / day / "_transcript.txt"
+        
+        # Use the real transcript for context, not Vosk's garbled text
+        full_transcript = ""
+        if daily_path.exists():
+            try:
+                full_transcript = daily_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        
+        # Build snippet from the real transcript if available
+        if full_transcript:
+            snippet = build_trigger_snippet(full_transcript)
+        else:
+            snippet = f"**{username}: {text}**"
+
+        from triggers import fire_instant_trigger, fetch_and_cache_recent_responses
+        await fetch_and_cache_recent_responses(bot, REPORT_CHANNEL_ID)
+        ok = await fire_instant_trigger(
+            vc_user_ids, daily_path, snippet, full_transcript,
+            username, user_id, 
+        )
+        if not ok:
+            write_trigger_file(vc_user_ids, daily_path, snippet, username, user_id)
+        log.info("Vosk trigger async complete (hook_ok=%s)", ok)
+    except Exception:
+        log.exception("Error in Vosk trigger async")
+
+
+CHIME_PATH = Path(__file__).parent / "assets" / "trigger_chime.wav"
+
+async def _play_trigger_chime() -> None:
+    """Play a short notification chime in the voice channel."""
+    guild = bot.get_guild(GUILD_ID)
+    if not guild or not guild.voice_client or not guild.voice_client.is_connected():
+        return
+    vc = guild.voice_client
+    if vc.is_playing():
+        vc.stop()  # stop previous chime so new trigger can play
+    try:
+        source = discord.FFmpegPCMAudio(str(CHIME_PATH))
+        # Lower volume to 20%
+        source = discord.PCMVolumeTransformer(source, volume=0.5)
+        vc.play(source)
+        log.info("🔔 Playing trigger chime in VC")
+    except Exception as e:
+        log.warning("Failed to play trigger chime: %s", e)
+
+
+async def _stream_wake_word(transcript: str, recent_context: str, trigger_user_id: int = 0, trigger_username: str = "unknown") -> None:
+    """Called by per-user streaming transcriber when 'benjamin' detected in real-time."""
+    from pathlib import Path
+    from config import RECORDINGS_DIR
+
+    # Check cooldown
+    if not check_cooldown(trigger_user_id):
+        await _play_cooldown_chime()
+        return
+
+    log.info("🎤 STREAM TRIGGER by %s", trigger_username)
+    mark_triggered(trigger_user_id)
+    
+    await _play_trigger_chime()
+    
+    # Get current VC members
+    vc_user_ids = {}
+    guild = bot.get_guild(GUILD_ID)
+    if guild and guild.voice_client and guild.voice_client.channel:
+        for m in guild.voice_client.channel.members:
+            if not m.bot:
+                vc_user_ids[m.id] = m.display_name
+
+    # Build snippet
+    snippet = f"**{trigger_username}**: {transcript[:300]}"
+    if recent_context:
+        lines = recent_context.strip().split("\n")
+        context_before = "\n".join(lines[-3:])
+        snippet = f"{context_before}\n**{trigger_username}: {transcript[:200]}**"
+
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily_path = RECORDINGS_DIR / day / "_transcript.txt"
+    
+    full_transcript = ""
+    if daily_path.exists():
+        try:
+            full_transcript = daily_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+
+    # Fire instant trigger (agent posts its own message)
+    from triggers import fire_instant_trigger, fetch_and_cache_recent_responses
+    await fetch_and_cache_recent_responses(bot, REPORT_CHANNEL_ID)
+    instant_ok = await fire_instant_trigger(
+        vc_user_ids, daily_path, snippet, full_transcript,
+        trigger_username, trigger_user_id, 
+    )
+    
+    if not instant_ok:
+        write_trigger_file(vc_user_ids, daily_path, snippet, trigger_username, trigger_user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +310,7 @@ async def join_best_channel() -> None:
 
 
 async def _join_best_channel_inner() -> None:
-    global audio_sink, _last_vc_activity
+    global audio_sink, _last_vc_activity, stream_transcriber
 
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
@@ -182,6 +330,8 @@ async def _join_best_channel_inner() -> None:
             if audio_sink:
                 audio_sink.cleanup()
                 audio_sink = None
+            if stream_transcriber:
+                await stream_transcriber.disconnect_all()
             await vc.disconnect()
         return
 
@@ -221,8 +371,18 @@ async def _join_best_channel_inner() -> None:
         log.warning("Voice client not connected after wait — skipping recording")
         return
 
+    # Start per-user streaming manager
+    if stream_transcriber is None:
+        stream_transcriber = PerUserStreamManager(on_wake_word=_stream_wake_word)
+        log.info("Per-user stream manager created for real-time wake word detection")
+
+    # Initialize local wake word detector (Vosk, offline)
+    global wake_detector
+    if wake_detector is None:
+        wake_detector = LocalWakeWordDetector(on_wake=_vosk_wake_callback)
+
     # Start audio capture via socket listener
-    audio_sink = UserAudioSink(bot, voice_detector)
+    audio_sink = UserAudioSink(bot, stream_transcriber=stream_transcriber, wake_detector=wake_detector)
     # Apply any SSRC mappings captured during handshake
     for ssrc, user_id in _pending_ssrc_map.items():
         audio_sink.register_speaking(user_id, ssrc)
@@ -307,8 +467,6 @@ async def inactivity_check():
     _report_generated_today = True
 
     try:
-        if audio_sink:
-            audio_sink.flush_raw_audio()
         report = await generate_daily_report()
         if report:
             await post_report_to_discord(report)
@@ -365,147 +523,144 @@ async def dave_stats():
             pass
 
 
-@tasks.loop(minutes=5)
-async def flush_raw_audio():
-    if audio_sink:
-        audio_sink.flush_raw_audio()
+# Wake word handling moved to triggers.py
 
 
-@tasks.loop(minutes=3)
+async def _check_wake_word(convo: str, daily_path, day: str):
+    """Check for 'benjamin' wake word and trigger response if found."""
+    from config import RECORDINGS_DIR
+    from pathlib import Path
+
+    # Count-based trigger: only fire if total "benjamin" mentions in full transcript
+    # exceed what we've already triggered on. This prevents re-triggering on old
+    # audio segments that get transcribed late (e.g. rifqn's old audio from hours ago).
+    count_path = RECORDINGS_DIR / day / "_benjamin_trigger_count.txt"
+    prev_count = 0
+    if count_path.exists():
+        try:
+            prev_count = int(count_path.read_text().strip())
+        except Exception:
+            pass
+
+    if daily_path.exists():
+        full_text = daily_path.read_text(encoding="utf-8")
+        current_count = full_text.lower().count("benjamin")
+    else:
+        current_count = convo.lower().count("benjamin")
+
+    should_trigger = current_count > prev_count
+    log.info("Wake word: current_count=%d prev_count=%d trigger=%s (convo=%d chars)",
+             current_count, prev_count, should_trigger, len(convo))
+
+    if not should_trigger:
+        return
+
+    # Check cooldown using shared function (batch doesn't know specific user)
+    if not check_cooldown(0):
+        await _play_cooldown_chime()
+        return
+
+    log.info("Wake word 'Benjamin' detected — triggering!")
+    mark_triggered(0)
+    await _play_trigger_chime()
+
+    # Get current VC members
+    vc_user_ids = {}
+    guild = bot.get_guild(GUILD_ID)
+    if guild and guild.voice_client and guild.voice_client.channel:
+        for m in guild.voice_client.channel.members:
+            if not m.bot:
+                vc_user_ids[m.id] = m.display_name
+    if not vc_user_ids and audio_sink:
+        vc_user_ids = dict(audio_sink._user_names)
+
+    # Build focused snippet from latest transcript
+    full_transcript = daily_path.read_text(encoding="utf-8") if daily_path.exists() else convo
+    snippet = build_trigger_snippet(full_transcript)
+
+    # Extract who said Benjamin from the transcript for TRIGGERED_BY field
+    triggered_by_username = ""
+    triggered_by_id = 0
+    # Find the last mention and extract the speaker
+    if snippet and "**" in snippet:
+        import re
+        match = re.search(r'\*\*([^:]+):', snippet)
+        if match:
+            triggered_by_username = match.group(1)
+            # Try to find the user ID
+            for uid, name in vc_user_ids.items():
+                if name == triggered_by_username:
+                    triggered_by_id = uid
+                    break
+
+    # Fire instant trigger (agent posts its own message)
+    from triggers import fire_instant_trigger, fetch_and_cache_recent_responses
+    await fetch_and_cache_recent_responses(bot, REPORT_CHANNEL_ID)
+    instant_ok = await fire_instant_trigger(
+        vc_user_ids, daily_path, snippet, full_transcript,
+        triggered_by_username, triggered_by_id, 
+    )
+    
+    if not instant_ok:
+        write_trigger_file(vc_user_ids, daily_path, snippet, triggered_by_username, triggered_by_id)
+
+    # Update mention count so we don't re-trigger for same mentions
+    if daily_path.exists():
+        count_path = RECORDINGS_DIR / day / "_benjamin_trigger_count.txt"
+        count_path.write_text(str(daily_path.read_text(encoding="utf-8").lower().count("benjamin")))
+
+    # Legacy trigger file
+    trigger_path = RECORDINGS_DIR / day / "_benjamin_triggered.txt"
+    id_map = "\n".join(f"{uid}:{name}" for uid, name in vc_user_ids.items())
+    trigger_path.write_text(f"USERS:\n{id_map}\n\nTRANSCRIPT:\n{convo}", encoding="utf-8")
+
+
+@tasks.loop(seconds=30)
 async def auto_transcribe():
     try:
         from audio.storage import get_new_speech_segments
 
         new_segs = get_new_speech_segments()
-        if len(new_segs) < 3:
+        if len(new_segs) < 1:
             return
         log.info("Auto-transcribing %d new segments", len(new_segs))
         report = await generate_daily_report()
+        log.info("Report result: %s", "has conversation" if report and report.get("conversation") else f"empty (report={'present' if report else 'None'})")
         if report:
             from config import RECORDINGS_DIR
 
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             daily_path = RECORDINGS_DIR / day / "_transcript.txt"
             convo = report.get("conversation", "")
+            log.info("Conversation length: %d chars", len(convo))
             if convo:
                 with open(daily_path, "a", encoding="utf-8") as f:
                     f.write(f"\n\n--- {datetime.now(timezone.utc).strftime('%H:%M')} ---\n\n")
                     f.write(convo)
                 log.info("Transcript appended to %s", daily_path)
 
-                _should_trigger = "benjamin" in convo.lower()
-                if _should_trigger:
-                    # Cooldown: don't re-trigger within 5 minutes
-                    from pathlib import Path
-                    pending = Path("/home/nik/clawd/projects/pascribe/bot/_pending_trigger.txt")
-                    if pending.exists():
-                        try:
-                            age = (datetime.now(timezone.utc) - datetime.fromisoformat(
-                                pending.read_text().split("\n")[0].split(": ", 1)[1]
-                            )).total_seconds()
-                            if age < 300:
-                                log.debug("Benjamin trigger cooldown (%ds ago), skipping", int(age))
-                                _should_trigger = False
-                        except Exception:
-                            pass
-                if _should_trigger:
-                    log.info("Wake word 'Benjamin' detected!")
-                    trigger_path = RECORDINGS_DIR / day / "_benjamin_triggered.txt"
-
-                    # Get current VC members (not all-time seen users)
-                    vc_user_ids = {}
-                    guild = bot.get_guild(GUILD_ID)
-                    if guild and guild.voice_client and guild.voice_client.channel:
-                        for m in guild.voice_client.channel.members:
-                            if not m.bot:
-                                vc_user_ids[m.id] = m.display_name
-                    if not vc_user_ids and audio_sink:
-                        # Fallback to audio sink if VC member list unavailable
-                        vc_user_ids = dict(audio_sink._user_names)
-
-                    id_map = "\n".join(f"{uid}:{name}" for uid, name in vc_user_ids.items())
-                    trigger_path.write_text(
-                        f"USERS:\n{id_map}\n\nTRANSCRIPT:\n{convo}", encoding="utf-8"
-                    )
-
-                    # Build focused transcript snippet around trigger
-                    def _build_trigger_snippet(full_convo: str, keyword: str = "benjamin") -> str:
-                        """Extract the sentence with 'benjamin' + 1 speaker above/below, trimmed."""
-                        import re
-                        speaker_re = re.compile(r"^([a-zA-Z0-9_]+): (.+)", re.DOTALL)
-                        # Split into speaker blocks: [(username, text), ...]
-                        blocks = []
-                        for line in full_convo.strip().split("\n"):
-                            m = speaker_re.match(line)
-                            if m:
-                                blocks.append((m.group(1), m.group(2)))
-                            elif blocks and not line.startswith("---") and not line.startswith("*—"):
-                                # Continuation of previous speaker
-                                blocks[-1] = (blocks[-1][0], blocks[-1][1] + " " + line)
-
-                        # Find block containing keyword (last occurrence)
-                        trigger_idx = None
-                        for i in range(len(blocks) - 1, -1, -1):
-                            if keyword in blocks[i][1].lower():
-                                trigger_idx = i
-                                break
-                        if trigger_idx is None:
-                            return full_convo[-300:]
-
-                        # Extract the sentence containing "benjamin" from the trigger block
-                        trigger_user, trigger_text = blocks[trigger_idx]
-                        sentences = re.split(r'(?<=[.!?])\s+', trigger_text)
-                        trigger_sentence = trigger_text[-150:]  # fallback
-                        for s in sentences:
-                            if keyword in s.lower():
-                                trigger_sentence = s.strip()
-                                break
-
-                        # Build output: 1 block above (trimmed) + trigger sentence + 1 block below (trimmed)
-                        parts = []
-                        if trigger_idx > 0:
-                            prev_user, prev_text = blocks[trigger_idx - 1]
-                            parts.append(f"{prev_user}: ...{prev_text[-120:]}")
-                        parts.append(f"**{trigger_user}: {trigger_sentence}**")
-                        if trigger_idx < len(blocks) - 1:
-                            next_user, next_text = blocks[trigger_idx + 1]
-                            parts.append(f"{next_user}: {next_text[:120]}...")
-                        return "\n".join(parts)
-
-                    # Post to #voice-reports with focused transcript for Ben
-                    report_channel = bot.get_channel(REPORT_CHANNEL_ID)
-                    if report_channel:
-                        try:
-                            # Read full day transcript for broader context
-                            full_transcript = ""
-                            if daily_path.exists():
-                                full_transcript = daily_path.read_text(encoding="utf-8")
-                            snippet = _build_trigger_snippet(full_transcript or convo)
-                            participant_names = ", ".join(name for name in vc_user_ids.values())
-                            BEN_BOT_ID = 1465343244370968648
-                            await report_channel.send(
-                                f"<@{BEN_BOT_ID}> 🎙️ **VOICE TRIGGER** — \"Benjamin\" mentioned in VC\n"
-                                f"**Members:** {participant_names}\n"
-                                f"**Transcript:**\n>>> {snippet[:1500]}",
-                                allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=BEN_BOT_ID)]),
-                            )
-                            log.info("Posted trigger to #voice-reports")
-                        except Exception as e:
-                            log.warning("Failed to post trigger: %s", e)
-
-                    # Also write trigger file as backup
-                    from pathlib import Path
-                    pending = Path("/home/nik/clawd/projects/pascribe/bot/_pending_trigger.txt")
-                    participant_str = ", ".join(f"{name} (<@{uid}>)" for uid, name in vc_user_ids.items())
-                    snippet = _build_trigger_snippet((daily_path.read_text(encoding="utf-8") if daily_path.exists() else convo))
-                    pending.write_text(
-                        f"TRIGGER_TIME: {datetime.now(timezone.utc).isoformat()}\n"
-                        f"PARTICIPANTS: {participant_str}\n"
-                        f"FULL_TRANSCRIPT: {daily_path}\n"
-                        f"TRANSCRIPT:\n{snippet}",
-                        encoding="utf-8",
-                    )
-                    log.info("Wrote pending trigger file")
+                # Batch wake word: check ONLY the newly transcribed text (not full transcript)
+                if "benjamin" in convo.lower():
+                    log.info("Batch wake word found in new transcription (%d chars)", len(convo))
+                    if not check_cooldown(0):
+                        await _play_cooldown_chime()
+                    else:
+                        mark_triggered(0)
+                        await _play_trigger_chime()
+                        vc_ids = {}
+                        g = bot.get_guild(GUILD_ID)
+                        if g and g.voice_client and g.voice_client.channel:
+                            for m in g.voice_client.channel.members:
+                                if not m.bot:
+                                    vc_ids[m.id] = m.display_name
+                        snippet = build_trigger_snippet(convo)
+                        full_text = daily_path.read_text(encoding="utf-8") if daily_path.exists() else convo
+                        from triggers import fire_instant_trigger, post_processing_placeholder, fetch_and_cache_recent_responses
+                        await fetch_and_cache_recent_responses(bot, REPORT_CHANNEL_ID)
+                        ph_id = await post_processing_placeholder(bot, REPORT_CHANNEL_ID)
+                        ok = await fire_instant_trigger(vc_ids, daily_path, snippet, full_text, placeholder_message_id=ph_id)
+                        if not ok:
+                            write_trigger_file(vc_ids, daily_path, snippet)
     except Exception:
         log.exception("Error in auto-transcribe")
 
@@ -515,6 +670,8 @@ async def auto_transcribe():
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_ready():
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
     log.info("Logged in as %s (ID: %d)", bot.user, bot.user.id)
     log.info("Guild target: %d", GUILD_ID)
     log.info("Report channel: %d", REPORT_CHANNEL_ID)
@@ -533,12 +690,18 @@ async def on_ready():
         channel_monitor.start()
     if not inactivity_check.is_running():
         inactivity_check.start()
-    if not flush_raw_audio.is_running():
-        flush_raw_audio.start()
     if not dave_stats.is_running():
         dave_stats.start()
     if not auto_transcribe.is_running():
         auto_transcribe.start()
+
+    # Initialize and start transcript analysis
+    if OPENROUTER_API_KEY:
+        analysis.init_analyzer(bot, OPENROUTER_API_KEY)
+        analysis.start_analysis()
+        log.info("Transcript analysis initialized and started")
+    else:
+        log.warning("No OpenRouter API key configured - transcript analysis disabled")
 
     # Force clear any stale voice state before first join
     guild = bot.get_guild(GUILD_ID)
@@ -576,11 +739,21 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    def _shutdown(sig, frame):
-        log.info("Received signal %s — shutting down", sig)
+    async def _do_shutdown():
         if audio_sink:
             audio_sink.cleanup()
-        loop.create_task(bot.close())
+        if stream_transcriber:
+            await stream_transcriber.disconnect_all()
+        await bot.close()
+
+    def _shutdown(sig, frame):
+        log.info("Received signal %s — shutting down", sig)
+        # Schedule cleanup on the running loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(_do_shutdown(), loop)
+        else:
+            sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)

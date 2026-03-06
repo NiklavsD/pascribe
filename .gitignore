@@ -6,3 +6,15 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+recordings/
+vosk-model-small-en-us-0.15/
+*.bak
+_pending_trigger.txt
+_recent_responses.txt
+_benjamin_trigger*
+recordings/
+vosk-model-small-en-us-0.15/
+*.bak
+_pending_trigger.txt
+_recent_responses.txt
+_benjamin_trigger*

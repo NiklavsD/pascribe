@@ -37,7 +37,7 @@ async def transcribe(audio_url: str) -> dict:
         # Submit
         payload = {
             "audio_url": audio_url,
-            "speech_models": ["universal-3-pro"],
+            "speech_models": ["universal-3-pro", "universal-2"],
             "language_detection": True,
             "speaker_labels": True,
         }

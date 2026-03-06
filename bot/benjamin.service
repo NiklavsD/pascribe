@@ -1,0 +1,25 @@
+[Unit]
+Description=Benjamin — Pascribe Discord Voice Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nik
+WorkingDirectory=/home/nik/clawd/projects/pascribe/bot
+ExecStart=/home/nik/clawd/projects/pascribe/bot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+EnvironmentFile=/home/nik/clawd/projects/pascribe/bot/.env
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/nik/clawd/projects/pascribe/bot/recordings
+
+[Install]
+WantedBy=default.target
