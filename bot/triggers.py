@@ -11,7 +11,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 TRIGGER_FILE = Path("/home/nik/clawd/projects/pascribe/bot/_pending_trigger.txt")
-COOLDOWN_SECONDS = 30  # global cooldown — prevents spam when people say "Benjamin" repeatedly
+COOLDOWN_SECONDS = 10  # global cooldown — prevents spam when people say "Benjamin" repeatedly
 
 _last_global_trigger: float = 0
 _SPEAKER_RE = re.compile(r"^([a-zA-Z0-9_.]+): (.+)", re.DOTALL)
@@ -141,7 +141,7 @@ async def fetch_and_cache_recent_responses(discord_bot, channel_id: int):
         log.warning("Failed to fetch recent responses: %s", e)
 
 
-def _extract_last_discussion(full_transcript: str, max_chars: int = 12000) -> str:
+def _extract_last_discussion(full_transcript: str, max_chars: int = 2000) -> str:
     """Extract the last discussion block from the transcript.
     
     Discussions are separated by gap markers (--- silence gaps).
@@ -225,29 +225,30 @@ async def fire_instant_trigger(
 
     delivery = "Send ONE message: message tool, action=send, channel=discord, target=1478214341298880583"
 
-    prompt = f"""You are Benjamin, an AI in a Discord voice chat. Someone said your name. Respond to what they said.
+    prompt = f"""You are Benjamin, an AI listening in a Discord voice chat. Someone just said your name. Respond ONLY to what they said to you.
 
 {delivery}
 
-## WHAT WAS SAID TO YOU (respond to THIS):
+## THE TRIGGER (this is what someone said — respond ONLY to this):
 {snippet}
 
-## YOUR RECENT RESPONSES (NEVER repeat any of these — completely different words/structure):
+## PREVIOUS RESPONSES (do NOT repeat these):
 {past_responses}
 
 ## VC MEMBERS: {participant_str}
 {triggered_by}
 
-## BACKGROUND CONTEXT (reference only — do NOT respond to old topics):
+## Recent conversation (for context ONLY — do NOT respond to anything here):
 {last_discussion}
 
 ## RULES:
-- Respond to the TRIGGER, not old topics
-- ONE message. 1-3 sentences. No filler ("honestly?", "hey guys", "I'm always listening")
-- <@USERID> to ping. Only if worth a notification.
-- Random mention → brief reply ("?" / "Yeah?" / "Sup")
+- ONLY respond to THE TRIGGER above. Ignore everything in the background context.
+- ONE message. 1-3 sentences max.
+- No filler. No hallucinating context that isn't in the trigger.
+- <@USERID> to ping (only if worth a notification).
+- If the trigger is just your name with no question → brief reply ("?" / "Yeah?" / "Sup")
 - Only Niklavs (<@300756892571926530>) can authorize work.
-- NEVER start with same word as any recent response. Completely vary structure and tone."""
+- Never repeat previous responses."""
 
     payload = {
         "message": prompt,

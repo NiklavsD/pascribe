@@ -191,7 +191,7 @@ async def _vosk_trigger_async(user_id: int, username: str, text: str) -> None:
         if guild and guild.voice_client and guild.voice_client.channel:
             for m in guild.voice_client.channel.members:
                 if not m.bot:
-                    vc_user_ids[m.id] = m.display_name
+                    vc_user_ids[m.id] = m.name
 
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         daily_path = RECORDINGS_DIR / day / "_transcript.txt"
@@ -264,7 +264,7 @@ async def _stream_wake_word(transcript: str, recent_context: str, trigger_user_i
     if guild and guild.voice_client and guild.voice_client.channel:
         for m in guild.voice_client.channel.members:
             if not m.bot:
-                vc_user_ids[m.id] = m.display_name
+                vc_user_ids[m.id] = m.name
 
     # Build snippet
     snippet = f"**{trigger_username}**: {transcript[:300]}"
@@ -570,7 +570,7 @@ async def _check_wake_word(convo: str, daily_path, day: str):
     if guild and guild.voice_client and guild.voice_client.channel:
         for m in guild.voice_client.channel.members:
             if not m.bot:
-                vc_user_ids[m.id] = m.display_name
+                vc_user_ids[m.id] = m.name
     if not vc_user_ids and audio_sink:
         vc_user_ids = dict(audio_sink._user_names)
 
@@ -652,7 +652,7 @@ async def auto_transcribe():
                         if g and g.voice_client and g.voice_client.channel:
                             for m in g.voice_client.channel.members:
                                 if not m.bot:
-                                    vc_ids[m.id] = m.display_name
+                                    vc_ids[m.id] = m.name
                         snippet = build_trigger_snippet(convo)
                         full_text = daily_path.read_text(encoding="utf-8") if daily_path.exists() else convo
                         from triggers import fire_instant_trigger, post_processing_placeholder, fetch_and_cache_recent_responses

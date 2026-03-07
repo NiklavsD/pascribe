@@ -1,0 +1,163 @@
+{
+  "type": "quick",
+  "date": "2026-03-07",
+  "recorded_from": "2026-03-07T17:06:08.097078",
+  "duration_minutes": 3,
+  "speech_minutes": 0.3,
+  "word_count": 264,
+  "segments": [
+    {
+      "time": "17:06:42",
+      "speaker": "you",
+      "text": "Niklas, when you ran Whisper locally, what model did you use? OpenAI, Whisper API, or other one?"
+    },
+    {
+      "time": "17:06:49",
+      "speaker": "you",
+      "text": "I mean, I told you just like three times, what do you mean?"
+    },
+    {
+      "time": "17:06:51",
+      "speaker": "you",
+      "text": "Because I'm building it now."
+    },
+    {
+      "time": "17:06:54",
+      "speaker": "you",
+      "text": "I did not use Whisper."
+    },
+    {
+      "time": "17:06:56",
+      "speaker": "you",
+      "text": "What did you do then?"
+    },
+    {
+      "time": "17:06:59",
+      "speaker": "you",
+      "text": "Like, wait, to send voice audio to it, but you're already doing it and it's already processing."
+    },
+    {
+      "time": "17:07:08",
+      "speaker": "you",
+      "text": "I already have that with Grok. I'm just, I want to have the, you know, when someone speaks, I press a button and it automatically transcripts it to text and put it in the notepad."
+    },
+    {
+      "time": "17:07:21",
+      "speaker": "you",
+      "text": "Right, right, right."
+    },
+    {
+      "time": "17:07:23",
+      "speaker": "you",
+      "text": "Let me tell you, Whisper model large v3."
+    },
+    {
+      "time": "17:07:37",
+      "speaker": "you",
+      "text": "But you know... OpenAI."
+    },
+    {
+      "time": "17:07:42",
+      "speaker": "you",
+      "text": "Yeah, look, look, look, look, look."
+    },
+    {
+      "time": "17:07:46",
+      "speaker": "you",
+      "text": "What is this app?"
+    },
+    {
+      "time": "17:07:52",
+      "speaker": "you",
+      "text": "The one I built."
+    },
+    {
+      "time": "17:07:58",
+      "speaker": "you",
+      "text": "Oh, you built this?"
+    },
+    {
+      "time": "17:08:01",
+      "speaker": "you",
+      "text": "Yeah."
+    },
+    {
+      "time": "17:08:02",
+      "speaker": "you",
+      "text": "Can you share this with me?"
+    },
+    {
+      "time": "17:08:09",
+      "speaker": "you",
+      "text": "Or put it on GitHub or something?"
+    },
+    {
+      "time": "17:08:11",
+      "speaker": "you",
+      "text": "Yeah, but look, the issue is, it's only you and Discord if you separate it in two different tracks using the voice meter cables, you know?"
+    },
+    {
+      "time": "17:08:25",
+      "speaker": "you",
+      "text": "So, for example, I have set microphone as cable output, which is going through voice meter, right?"
+    },
+    {
+      "time": "17:08:38",
+      "speaker": "you",
+      "text": "And system audio, as in Discord, that."
+    },
+    {
+      "time": "17:08:41",
+      "speaker": "you",
+      "text": "But the issue is, it only..."
+    },
+    {
+      "time": "17:08:43",
+      "speaker": "you",
+      "text": "It only picks up two audio inputs, right?"
+    },
+    {
+      "time": "17:08:46",
+      "speaker": "you",
+      "text": "It wouldn't pick up every, you know, person separately."
+    },
+    {
+      "time": "17:08:52",
+      "speaker": "you",
+      "text": "You can either use..."
+    },
+    {
+      "time": "17:08:53",
+      "speaker": "you",
+      "text": "My one."
+    },
+    {
+      "time": "17:08:54",
+      "speaker": "you",
+      "text": "Right, yeah."
+    },
+    {
+      "time": "17:08:55",
+      "speaker": "you",
+      "text": "But if you use like a local model, which is small, right?"
+    },
+    {
+      "time": "17:08:58",
+      "speaker": "you",
+      "text": "It loads up with 3.5 gigabytes of VRAM."
+    },
+    {
+      "time": "17:09:03",
+      "speaker": "you",
+      "text": "Then, you know, it's going to be easy."
+    },
+    {
+      "time": "17:09:05",
+      "speaker": "you",
+      "text": "I can just do it now, like literally press this button."
+    }
+  ],
+  "transcript": "[17:06:42] you: Niklas, when you ran Whisper locally, what model did you use? OpenAI, Whisper API, or other one?\n[17:06:49] you: I mean, I told you just like three times, what do you mean?\n[17:06:51] you: Because I'm building it now.\n[17:06:54] you: I did not use Whisper.\n[17:06:56] you: What did you do then?\n[17:06:59] you: Like, wait, to send voice audio to it, but you're already doing it and it's already processing.\n[17:07:08] you: I already have that with Grok. I'm just, I want to have the, you know, when someone speaks, I press a button and it automatically transcripts it to text and put it in the notepad.\n[17:07:21] you: Right, right, right.\n[17:07:23] you: Let me tell you, Whisper model large v3.\n[17:07:37] you: But you know... OpenAI.\n[17:07:42] you: Yeah, look, look, look, look, look.\n[17:07:46] you: What is this app?\n[17:07:52] you: The one I built.\n[17:07:58] you: Oh, you built this?\n[17:08:01] you: Yeah.\n[17:08:02] you: Can you share this with me?\n[17:08:09] you: Or put it on GitHub or something?\n[17:08:11] you: Yeah, but look, the issue is, it's only you and Discord if you separate it in two different tracks using the voice meter cables, you know?\n[17:08:25] you: So, for example, I have set microphone as cable output, which is going through voice meter, right?\n[17:08:38] you: And system audio, as in Discord, that.\n[17:08:41] you: But the issue is, it only...\n[17:08:43] you: It only picks up two audio inputs, right?\n[17:08:46] you: It wouldn't pick up every, you know, person separately.\n[17:08:52] you: You can either use...\n[17:08:53] you: My one.\n[17:08:54] you: Right, yeah.\n[17:08:55] you: But if you use like a local model, which is small, right?\n[17:08:58] you: It loads up with 3.5 gigabytes of VRAM.\n[17:09:03] you: Then, you know, it's going to be easy.\n[17:09:05] you: I can just do it now, like literally press this button.",
+  "_received_at": "2026-03-07T15:09:09.564693+00:00",
+  "_filename": "2026-03-07_20260307_150909.json"
+}
