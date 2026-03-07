@@ -1,105 +1,89 @@
 <p align="center">
-  <img src="assets/banner.png" alt="Benjamin Banner" width="100%">
+  <img src="assets/banner.png" alt="Benjamin" width="100%">
 </p>
 
 <p align="center">
-  <b>Always-on Discord voice bot — listens, transcribes, and responds when called.</b>
+  <b>Discord voice bot that listens, transcribes, and responds when called by name.</b><br>
+  Part of the <a href="../README.md">Pascribe</a> ecosystem.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11+-blue?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/discord.py-2.8+-5865F2?logo=discord&logoColor=white" alt="discord.py">
+  <img src="https://img.shields.io/badge/AssemblyAI-transcription-00e5a0?logo=data:image/svg+xml;base64," alt="AssemblyAI">
+  <img src="https://img.shields.io/badge/Vosk-wake%20word-orange" alt="Vosk">
 </p>
 
 ---
 
-## What is Benjamin?
+## Overview
 
-Benjamin sits in your Discord voice channel, captures per-user audio streams, transcribes them via AssemblyAI, and responds intelligently when someone says his name. He uses a triple-detection system (local Vosk STT + AssemblyAI streaming + batch transcription) to catch wake words with ~95% reliability.
+Benjamin joins your Discord voice channel, captures per-user audio through Discord's DAVE E2EE encryption, and runs a triple wake word detection pipeline. Say "Benjamin" and he'll respond with a contextual AI reply within ~15 seconds.
 
-## Features
+### Wake Word Detection (Triple Pipeline)
 
-- 🎙️ **Per-user audio capture** — separate streams per speaker with VAD filtering
-- 🔐 **DAVE E2EE support** — full Discord voice encryption (MLS protocol)
-- 🗣️ **Wake word detection** — say "Benjamin" and he responds via AI
-- ⚡ **Instant response** — Vosk local STT for ~2s detection, AI response in ~15s
-- 🔔 **Audio feedback** — ascending chime on trigger, descending beep on cooldown
-- 📝 **Dual transcription** — streaming (real-time) + batch (archive quality)
-- 🤖 **AI responses** — Claude Opus generates contextual replies posted to Discord
-- 📊 **Daily reports** — auto-generated conversation summaries
-- 🔄 **Self-improving** — nightly cron reviews response quality and tunes prompts
-- 🛡️ **Privacy controls** — voice opt-out keywords, channel blacklisting
+| Layer | Engine | Latency | Cost | Catch Rate |
+|-------|--------|---------|------|------------|
+| 1. Local | Vosk STT (offline, CPU) | ~2s | Free | ~70% |
+| 2. Streaming | AssemblyAI real-time | ~5s | $0.60/hr | ~50% |
+| 3. Batch | AssemblyAI (30s interval) | ~30s | $0.21/hr | ~95% |
+
+All three feed into a unified trigger system with **30-second global cooldown** — only one response per mention.
+
+### Response Flow
+
+```
+🎤 "Hey Benjamin" detected
+  → 🔔 Chime plays in VC (or 🔕 cooldown beep if blocked)
+  → ⏳ Placeholder posted to #voice-reports
+  → 🤖 Claude Opus generates contextual response
+  → 💬 Response posted, placeholder auto-deletes
+```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    Discord Voice                      │
-│  DAVE E2EE → Transport Decrypt → DAVE Decrypt → Opus │
-└──────────────────────┬──────────────────────────────┘
-                       │ PCM Audio (48kHz stereo)
-                       ▼
-              ┌────────┴────────┐
-              │  UserAudioSink  │
-              └────┬───┬───┬───┘
-                   │   │   │
-          ┌────────┘   │   └────────┐
-          ▼            ▼            ▼
-    ┌──────────┐ ┌──────────┐ ┌──────────┐
-    │   Vosk   │ │ Streaming│ │   VAD    │
-    │  (local) │ │(Assembly)│ │ + Batch  │
-    │ Wake Word│ │ Wake Word│ │Transcribe│
-    └────┬─────┘ └────┬─────┘ └────┬─────┘
-         │            │            │
-         └──────┬─────┘            │
-                ▼                  ▼
-         ┌────────────┐    ┌────────────┐
-         │  Trigger    │    │ Transcript │
-         │  System     │    │  Archive   │
-         └──────┬──────┘    └────────────┘
-                │
-                ▼
-         ┌────────────┐
-         │  OpenClaw   │
-         │  /hooks/    │
-         │  agent      │
-         └──────┬──────┘
-                │
-                ▼
-         ┌────────────┐
-         │  Claude     │
-         │  Response   │
-         │  → Discord  │
-         └─────────────┘
+Discord Voice (DAVE E2EE)
+    │
+    ▼
+┌──────────────────┐
+│  UserAudioSink   │  Transport decrypt → DAVE decrypt → Opus decode
+└──┬────┬────┬─────┘
+   │    │    │
+   ▼    ▼    ▼
+ Vosk  Stream  VAD + Batch
+(local) (AAI)  (AAI)
+   │    │       │
+   └──┬─┘       │
+      ▼         ▼
+  Trigger    Transcript
+  System     Archive
+      │
+      ▼
+  OpenClaw → Claude → Discord
 ```
 
-## Files
+## Features
 
-```
-main.py                     Bot entrypoint, voice management, wake word routing
-config.py                   Environment config (.env)
-triggers.py                 Unified trigger system (cooldown, prompt, webhook)
-wakeword.py                 Local Vosk wake word detector (offline, CPU-only)
-analysis.py                 Transcript analysis via OpenRouter (optional)
-self_improve.md             Self-improvement log (auto-updated by cron)
-audio/
-  capture.py                Per-user AudioSink: DAVE decrypt → Opus → PCM → VAD
-  vad.py                    WebRTC VAD speech segmenter
-  storage.py                WAV file storage + segment tracking
-transcription/
-  assemblyai.py             AssemblyAI batch API client
-  pipeline.py               Per-segment transcription orchestration
-  streaming.py              Per-user AssemblyAI real-time streaming
-commands/
-  slash.py                  /pascribe process & /pascribe status
-assets/
-  trigger_chime.wav         Ascending two-tone (trigger accepted)
-  cooldown_chime.wav        Descending two-tone (cooldown active)
-```
+| Feature | Description |
+|---------|-------------|
+| 🎙️ Per-user capture | Separate audio streams per speaker, VAD filtered |
+| 🔐 DAVE E2EE | Full Discord voice encryption support (MLS protocol v1) |
+| 🗣️ Wake word | "Benjamin" triggers AI response via triple detection |
+| ⚡ Instant feedback | Audio chimes for trigger/cooldown, ⏳ placeholder in chat |
+| 📝 Transcription | Dual pipeline — streaming (real-time) + batch (archive) |
+| 🤖 AI responses | Claude Opus, context-aware, anti-repetition system |
+| 📊 Daily reports | Auto-generated conversation summaries |
+| 🔄 Self-improving | Nightly cron reviews response quality and tunes prompts |
+| 🛡️ Privacy | Voice opt-out keywords, channel blacklisting |
 
 ## Setup
 
 ### Prerequisites
 
-- Python 3.11+
-- FFmpeg (`sudo apt install ffmpeg`)
-- libopus (`sudo apt install libopus0`)
-- Vosk model (auto-downloaded: `vosk-model-small-en-us-0.15`, ~67MB)
+```bash
+sudo apt install ffmpeg libopus0
+```
 
 ### Install
 
@@ -108,22 +92,22 @@ cd bot
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-
 cp .env.example .env
-# Edit .env with your tokens
 ```
 
-### Environment Variables
+### Configuration
 
 ```env
-DISCORD_TOKEN=           # Discord bot token
-ASSEMBLYAI_API_KEY=      # AssemblyAI API key (batch transcription)
-GUILD_ID=                # Target Discord server ID
-REPORT_CHANNEL_ID=       # Channel for voice reports
-OPENCLAW_GATEWAY_URL=    # OpenClaw gateway (for AI responses)
-OPENCLAW_GATEWAY_TOKEN=  # OpenClaw auth token
-OPENROUTER_API_KEY=      # Optional: transcript analysis
+DISCORD_TOKEN=            # Discord bot token
+ASSEMBLYAI_API_KEY=       # AssemblyAI API key ($50 free credits at signup!)
+GUILD_ID=                 # Target Discord server ID
+REPORT_CHANNEL_ID=        # Channel for voice trigger responses
+OPENCLAW_GATEWAY_URL=     # OpenClaw gateway URL (for AI responses)
+OPENCLAW_GATEWAY_TOKEN=   # OpenClaw auth token
+OPENROUTER_API_KEY=       # Optional: free transcript analysis
 ```
+
+> 💡 **AssemblyAI offers $50 free credits** on signup at [assemblyai.com](https://www.assemblyai.com) — enough for ~230 hours of batch transcription.
 
 ### Run
 
@@ -132,45 +116,56 @@ OPENROUTER_API_KEY=      # Optional: transcript analysis
 python main.py
 
 # Systemd service (recommended)
+cp benjamin.service ~/.config/systemd/user/
 systemctl --user enable --now benjamin
 ```
 
-## How It Works
+## Files
 
-### Wake Word Detection (Triple Pipeline)
+```
+main.py                     Bot entrypoint, voice management, wake word routing
+config.py                   Environment configuration
+triggers.py                 Unified trigger system (cooldown, prompt, webhook)
+wakeword.py                 Local Vosk wake word detector (offline, CPU-only)
+analysis.py                 Transcript analysis via OpenRouter (optional)
+self_improve.md             Self-improvement log (auto-updated nightly)
+audio/
+  capture.py                DAVE decrypt → Opus decode → PCM → VAD pipeline
+  vad.py                    WebRTC VAD speech segmenter
+  storage.py                WAV file storage + segment tracking
+transcription/
+  assemblyai.py             AssemblyAI batch API client
+  pipeline.py               Per-segment transcription orchestration
+  streaming.py              Per-user real-time streaming transcription
+commands/
+  slash.py                  /pascribe process & /pascribe status
+assets/
+  trigger_chime.wav         Ascending two-tone (trigger accepted)
+  cooldown_chime.wav        Descending beep (cooldown active)
+  banner.png                README banner
+```
 
-1. **Vosk (instant, local)** — Offline STT on CPU, checks partial results for "benjamin". ~2s latency, no API cost.
-2. **AssemblyAI Streaming** — Per-user WebSocket streams, catches what Vosk misses. ~5s latency.
-3. **Batch fallback** — Every 30s, new speech segments are transcribed and checked. Catches anything the other two missed.
-
-All three feed into a unified trigger system with a **30-second global cooldown** — only one response per mention regardless of which detector fires first.
-
-### Response Flow
-
-1. Wake word detected → ascending chime plays in VC
-2. ⏳ "Processing" placeholder posted to #voice-reports
-3. Trigger fires via OpenClaw `/hooks/agent` webhook
-4. Claude Opus reads the trigger context + recent conversation
-5. Response posted to #voice-reports, placeholder auto-deletes
-
-### Audio Pipeline
-
-- Discord DAVE E2EE (protocol v1, `aead_xchacha20_poly1305_rtpsize`)
-- Per-user Opus decoding via custom ctypes wrapper
-- 48kHz stereo → mono downsampling for Vosk (16kHz) and streaming
-- WebRTC VAD (aggressiveness=3) filters noise into speech segments
-- Segments saved as WAV files, batch-transcribed individually for accurate speaker attribution
-
-## Cost
+## Cost Estimate
 
 | Component | Cost | Notes |
 |-----------|------|-------|
-| Vosk wake word | Free | Local, CPU-only |
+| Vosk wake word | Free | Local CPU, ~67MB model |
 | AssemblyAI batch | ~$0.21/hr | Per-segment transcription |
 | AssemblyAI streaming | ~$0.60/hr | Per-user real-time (optional) |
-| Claude Opus response | ~$0.05/trigger | Via OpenClaw |
-| **Typical daily cost** | **$5-15** | Depends on VC activity |
+| Claude response | ~$0.05/trigger | Via OpenClaw webhook |
+| **Typical daily** | **$5–15** | Depends on VC activity |
 
-## License
+## Technical Details
 
-Private — part of the Pascribe project.
+- **DAVE E2EE**: Protocol v1, `aead_xchacha20_poly1305_rtpsize` transport, MLS group key exchange via `davey` package
+- **Audio**: 48kHz stereo PCM → mono downsample → 16kHz for Vosk/streaming
+- **VAD**: WebRTC VAD aggressiveness=3 (high, filters mic noise)
+- **Vosk model**: `vosk-model-small-en-us-0.15` (~67MB, English, offline)
+- **Anti-repetition**: Past responses cached and injected into prompt
+- **Self-improvement**: Nightly cron reviews responses, adjusts prompts, logs findings
+
+---
+
+<p align="center">
+  <sub>Benjamin is part of <a href="../README.md">Pascribe</a> — audio transcription tools for desktop and Discord.</sub>
+</p>

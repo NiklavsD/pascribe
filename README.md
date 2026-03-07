@@ -1,5 +1,17 @@
 # Pascribe
 
+Audio transcription toolkit — desktop capture + Discord voice bot.
+
+| Component | Description | Platform |
+|-----------|-------------|----------|
+| **Pascribe Desktop** | Rolling audio buffer → hotkey → Whisper transcription → clipboard | Windows |
+| **[Benjamin](bot/)** | Discord voice bot — joins VC, transcribes, responds to wake word | Linux |
+| **[Analysis Server](server/)** | Transcript analysis pipeline (topics, knowledge, research) | Any |
+
+---
+
+## Pascribe Desktop
+
 Rolling audio buffer → hotkey → Whisper transcription → clipboard.
 
 Captures mic and system audio into a rolling RAM buffer. Press a hotkey to transcribe the last N minutes to clipboard. Optionally records full-day audio for end-of-day speaker-labeled transcription via AssemblyAI.
