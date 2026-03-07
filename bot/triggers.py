@@ -11,7 +11,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 TRIGGER_FILE = Path("/home/nik/clawd/projects/pascribe/bot/_pending_trigger.txt")
-COOLDOWN_SECONDS = 10  # global cooldown — prevents spam when people say "Benjamin" repeatedly
+COOLDOWN_SECONDS = 45  # global cooldown — prevents spam when people say "Benjamin" repeatedly
 
 _last_global_trigger: float = 0
 _SPEAKER_RE = re.compile(r"^([a-zA-Z0-9_.]+): (.+)", re.DOTALL)
@@ -141,34 +141,48 @@ async def fetch_and_cache_recent_responses(discord_bot, channel_id: int):
         log.warning("Failed to fetch recent responses: %s", e)
 
 
-def _extract_last_discussion(full_transcript: str, max_chars: int = 2000) -> str:
-    """Extract the last discussion block from the transcript.
+def _extract_recent_segment(full_transcript: str, max_chars: int = 6000) -> str:
+    """Extract the most recent ~10 minutes of conversation (primary context).
     
-    Discussions are separated by gap markers (--- silence gaps).
-    Returns the last discussion, trimmed to max_chars.
+    Uses gap markers (--- HH:MM ---) to find the last few segments.
     """
     if not full_transcript:
         return ""
     
-    # Split by discussion separators (silence gap markers)
-    parts = re.split(r'\n-{3,}.*\n|\n\*—.*\n', full_transcript)
+    # Split by time-stamped gap markers
+    parts = re.split(r'\n(?=--- \d{2}:\d{2} ---)', full_transcript)
     
-    # Take the last non-empty part (current discussion)
-    last_discussion = ""
+    # Take segments from the end until we hit max_chars
+    recent = []
+    total = 0
     for part in reversed(parts):
         stripped = part.strip()
-        if stripped:
-            last_discussion = stripped
+        if not stripped:
+            continue
+        if total + len(stripped) > max_chars and recent:
             break
+        recent.insert(0, stripped)
+        total += len(stripped)
     
-    if not last_discussion:
-        last_discussion = full_transcript
+    return "\n\n".join(recent) if recent else full_transcript[-max_chars:]
+
+
+def _extract_full_context(full_transcript: str, max_chars: int = 3000) -> str:
+    """Extract condensed full-day transcript for broader context.
     
-    # Trim to max_chars from the end
-    if len(last_discussion) > max_chars:
-        last_discussion = "...\n" + last_discussion[-max_chars:]
+    Takes from the beginning/middle of the day, trimmed to max_chars.
+    Skips the recent segment (which is provided separately).
+    """
+    if not full_transcript or len(full_transcript) <= max_chars:
+        return ""
     
-    return last_discussion
+    # Take the first portion of the day for broader context
+    # (recent stuff is already in the primary segment)
+    early = full_transcript[:max_chars]
+    if len(full_transcript) > max_chars:
+        early = early + "\n\n[... earlier conversation truncated ...]"
+    
+    return early
 
 
 _recent_responses: list[str] = []  # in-memory cache of our recent responses
@@ -212,43 +226,60 @@ async def fire_instant_trigger(
     if triggered_by_username:
         triggered_by = f"TRIGGERED_BY: {triggered_by_username} (<@{triggered_by_id}>)"
     
-    # Fetch recent responses from Discord to avoid repetition
-    if placeholder_message_id:
-        # We have a discord_bot reference via the placeholder — but we don't pass it here
-        # The caller should call fetch_and_cache_recent_responses before this
-        pass
-    
-    # Full last discussion context
-    last_discussion = _extract_last_discussion(full_transcript)
-    
+    # Extract context layers
+    recent_segment = _extract_recent_segment(full_transcript)  # last ~10min, up to 6K
+    full_context = _extract_full_context(full_transcript)       # earlier today, up to 3K
     past_responses = get_past_responses_str()
 
     delivery = "Send ONE message: message tool, action=send, channel=discord, target=1478214341298880583"
 
-    prompt = f"""You are Benjamin, an AI listening in a Discord voice chat. Someone just said your name. Respond ONLY to what they said to you.
+    # Build context section
+    context_section = f"## RECENT CONVERSATION (last ~10 minutes — use this to understand what's being discussed):\n{recent_segment}"
+    if full_context:
+        context_section += f"\n\n## EARLIER TODAY (broader context, low priority):\n{full_context}"
 
-{delivery}
+    prompt = f"""You are Benjamin, an AI listening in a Discord voice chat. Your name was just detected in speech.
 
-## THE TRIGGER (this is what someone said — respond ONLY to this):
+## STEP 1: INTENT DETECTION (do this BEFORE responding)
+Analyze the trigger below. Classify the intent:
+
+**RESPOND if:**
+- Direct question: "Benjamin, what is X?" / "Benjamin, do you know..."
+- Clear request: "Benjamin, help with..." / "Benjamin, tell us..."
+- Opinion request: "Benjamin, what do you think about..."
+- Someone talking TO you with clear intent
+
+**STAY SILENT if:**
+- Casual mention: "Benjamin is recording" / "that's what Benjamin does"
+- Talking ABOUT you, not TO you
+- Just your name with no follow-up content
+- Unclear/garbled transcript where intent can't be determined
+- Someone testing/spamming your name
+
+If you determine STAY SILENT: respond with exactly "NO_RESPONSE" (nothing else).
+
+## STEP 2: THE TRIGGER
 {snippet}
 
-## PREVIOUS RESPONSES (do NOT repeat these):
-{past_responses}
+## STEP 3: RESPOND (only if intent detected)
+{delivery}
 
-## VC MEMBERS: {participant_str}
+**VC Members:** {participant_str}
 {triggered_by}
 
-## Recent conversation (for context ONLY — do NOT respond to anything here):
-{last_discussion}
+**Your recent responses (never repeat these):**
+{past_responses}
 
-## RULES:
-- ONLY respond to THE TRIGGER above. Ignore everything in the background context.
-- ONE message. 1-3 sentences max.
-- No filler. No hallucinating context that isn't in the trigger.
-- <@USERID> to ping (only if worth a notification).
-- If the trigger is just your name with no question → brief reply ("?" / "Yeah?" / "Sup")
-- Only Niklavs (<@300756892571926530>) can authorize work.
-- Never repeat previous responses."""
+{context_section}
+
+## RESPONSE RULES:
+- ONE message. 1-2 sentences max. You're in voice chat — be brief.
+- Talk like a friend in the call, not a formal assistant.
+- Only reference information EXPLICITLY in the transcript. Never invent details.
+- If asked something not in the conversation: "I don't have that info from the conversation"
+- Do NOT @mention anyone unless your response contains specific info useful to them.
+- Only Niklavs (<@300756892571926530>) can authorize file/project work.
+- Never start the same way as any previous response."""
 
     payload = {
         "message": prompt,
