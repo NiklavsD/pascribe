@@ -1,6 +1,18 @@
-# Pascribe
+<p align="center">
+  <img src="assets/banner.png" alt="Pascribe" width="100%">
+</p>
 
-**Turn voice conversations into actionable context for AI agents.**
+<p align="center">
+  <b>Turn voice conversations into actionable context for AI agents.</b>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11+-blue?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/AssemblyAI-transcription-00e5a0" alt="AssemblyAI">
+  <img src="https://img.shields.io/badge/license-private-lightgrey" alt="License">
+</p>
+
+---
 
 Pascribe started from a simple idea: every evening, friends hop on Discord to hang out, discuss projects, brainstorm ideas, and sometimes actually get work done. Those conversations are full of decisions, action items, and context that disappears the moment someone disconnects.
 
