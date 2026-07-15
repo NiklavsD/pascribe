@@ -15,14 +15,15 @@ from typing import TYPE_CHECKING
 
 import nacl.secret
 
-from audio.storage import save_pcm_as_wav
+from audio.storage import save_pcm_as_wav, record_speaker_id
 from audio.vad import SpeechSegmenter
-from config import MIN_SPEECH_DURATION, SAMPLE_RATE, PCM_SAMPLE_WIDTH
+from config import MIN_SPEECH_DURATION, SAMPLE_RATE, PCM_SAMPLE_WIDTH, GUILD_ID
 
 if TYPE_CHECKING:
     import discord
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +404,16 @@ class UserAudioSink:
 
         username = self._resolve_username(user_id)
 
+        # Tee to the realtime duplex session when one is active (additive —
+        # transcription/wake-word consumers below are unaffected).
+        import duplex_mode
+        _dx = duplex_mode.get()
+        if _dx is not None:
+            try:
+                _dx.feed_pcm(user_id, pcm_stereo)
+            except Exception:
+                pass
+
         # Feed to per-user streaming transcriber (mono 48kHz → will be downsampled to 16kHz)
         if self._stream_transcriber:
             from audio.vad import stereo_to_mono
@@ -429,8 +440,27 @@ class UserAudioSink:
             self._wake_detector.add_user(user_id, username)
             self._wake_detector.feed_audio(user_id, vosk_mono)
 
+        # Track VAD state before processing to detect speech-start events
+        was_in_speech = state.segmenter._in_speech
         # VAD
         segments = state.segmenter.process_chunk(pcm_stereo)
+        # Speech-start detection: if we transitioned from not-speaking to speaking,
+        # and Ben's TTS is currently playing, interrupt it so the user can talk.
+        if not was_in_speech and state.segmenter._in_speech:
+            try:
+                # Duplex has its own barge-in (playback.clear); vc.stop() here
+                # would permanently detach the duplex playback source.
+                import duplex_mode
+                guild = self.bot.get_guild(GUILD_ID) if hasattr(self, 'bot') else None
+                if (duplex_mode.get() is None and guild and guild.voice_client
+                        and guild.voice_client.is_playing()):
+                    # Don't interrupt our own chimes (short clips) — only TTS
+                    # TTS files live in /tmp/benjamin_tts. Check current source.
+                    vc = guild.voice_client
+                    vc.stop()
+                    log.info("🛑 TTS interrupted by user %s speaking", username)
+            except Exception:
+                pass
         for segment in segments:
             duration = len(segment) / (SAMPLE_RATE * PCM_SAMPLE_WIDTH)
             if duration < MIN_SPEECH_DURATION:
@@ -448,6 +478,9 @@ class UserAudioSink:
                 channels=1,
                 sample_width=PCM_SAMPLE_WIDTH,
             )
+            # Remember (username → user_id) in today's sidecar so pascribe-server
+            # gets the Discord IDs alongside the transcript participants list.
+            record_speaker_id(username, user_id)
             log.info("Speech segment from %s: %.1fs", username, duration)
 
     # ------------------------------------------------------------------
@@ -501,6 +534,7 @@ class UserAudioSink:
                     channels=1,
                     sample_width=PCM_SAMPLE_WIDTH,
                 )
+                record_speaker_id(username, user_id)
 
         self._ssrc_states.clear()
         self._ssrc_to_user.clear()

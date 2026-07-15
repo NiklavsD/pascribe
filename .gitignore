@@ -18,3 +18,10 @@ vosk-model-small-en-us-0.15/
 _pending_trigger.txt
 _recent_responses.txt
 _benjamin_trigger*
+
+# Secret .env backups (timestamped — *.bak doesn't catch .env.bak.<ts>)
+.env.bak*
+*.env.bak*
+# Runtime logs incl. private voice transcripts / usage / session state
+logs/
+bot/logs/

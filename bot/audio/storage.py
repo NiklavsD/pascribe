@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import wave
 from datetime import datetime, timezone
@@ -11,6 +12,45 @@ from pathlib import Path
 from config import RECORDINGS_DIR, SAMPLE_RATE, CHANNELS, PCM_SAMPLE_WIDTH
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Participants sidecar — maps username → Discord user_id per recording day.
+# Audio files are keyed by username for legacy reasons; this sidecar carries
+# the Discord ID through to pascribe-server so downstream (idea-gen) can
+# ping the speakers an idea drew from.
+# ---------------------------------------------------------------------------
+
+def _participants_sidecar(date: datetime | None = None) -> Path:
+    date = date or datetime.now(timezone.utc)
+    day_str = date.strftime("%Y-%m-%d")
+    return RECORDINGS_DIR / day_str / "_participants.json"
+
+
+def record_speaker_id(username: str, user_id: int,
+                      date: datetime | None = None) -> None:
+    """Idempotently record (username, user_id) in today's sidecar. Safe to
+    call once per save_pcm_as_wav."""
+    path = _participants_sidecar(date)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = json.loads(path.read_text()) if path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        existing = {}
+    if existing.get(username) == user_id:
+        return
+    existing[username] = int(user_id)
+    path.write_text(json.dumps(existing, indent=2))
+
+
+def load_speaker_ids(date: datetime | None = None) -> dict[str, int]:
+    path = _participants_sidecar(date)
+    if not path.exists():
+        return {}
+    try:
+        return {str(k): int(v) for k, v in json.loads(path.read_text()).items()}
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
 
 
 def _user_dir(username: str, date: datetime | None = None) -> Path:

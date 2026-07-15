@@ -28,24 +28,52 @@ from config import (
     REPORT_CHANNEL_ID,
     INACTIVITY_THRESHOLD_S,
     OPENROUTER_API_KEY,
+    GCP_PROJECT_ID,
+    TTS_ENABLED,
+    TTS_VOICE,
+    TTS_SPEAKING_RATE,
+    TTS_PITCH,
+    TTS_VOLUME_GAIN_DB,
+    TTS_VOICE_POOL,
 )
+import random
 from transcription.pipeline import generate_daily_report
-from transcription.streaming import PerUserStreamManager
+from transcription.gcp_streaming import GCPPerUserStreamManager
 from triggers import check_cooldown, mark_triggered, build_trigger_snippet, write_trigger_file
 from wakeword import LocalWakeWordDetector
 import analysis
+import tts
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+    format="%(asctime)s.%(msecs)03d %(levelname)-8s %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
 # Reduce gateway spam (DAVE handshake logged at INFO)
 logging.getLogger("discord.gateway").setLevel(logging.WARNING)
 log = logging.getLogger("benjamin")
+
+# Dedicated trigger-flow logger writing to ./logs/trigger-flow.log
+# Captures the full lifecycle of each wake word event with high-res timestamps.
+import os
+_log_dir = Path(__file__).parent / "logs"
+_log_dir.mkdir(parents=True, exist_ok=True)
+_trigger_handler = logging.FileHandler(_log_dir / "trigger-flow.log", mode="a", encoding="utf-8")
+_trigger_handler.setFormatter(logging.Formatter(
+    "%(asctime)s.%(msecs)03d %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+trigger_log = logging.getLogger("trigger-flow")
+trigger_log.setLevel(logging.INFO)
+# Idempotent — only add handler if not already present (prevents duplicates on re-import)
+if not any(isinstance(h, logging.FileHandler) and "trigger-flow.log" in getattr(h, "baseFilename", "")
+           for h in trigger_log.handlers):
+    trigger_log.addHandler(_trigger_handler)
+trigger_log.propagate = False  # don't double-log to stdout
 
 # ---------------------------------------------------------------------------
 # Bot setup  (discord.py uses commands.Bot, not discord.Bot)
@@ -54,10 +82,11 @@ intents = discord.Intents.default()
 intents.voice_states = True
 intents.guilds = True
 intents.members = True
+intents.message_content = True  # Needed to read Ben's response messages for TTS
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 audio_sink: UserAudioSink | None = None
-stream_transcriber: PerUserStreamManager | None = None
+stream_transcriber: GCPPerUserStreamManager | None = None
 wake_detector: LocalWakeWordDetector | None = None
 _joining: bool = False
 _main_loop: asyncio.AbstractEventLoop | None = None
@@ -65,6 +94,15 @@ _main_loop: asyncio.AbstractEventLoop | None = None
 # Track when someone was last in VC (for inactivity-based report)
 _last_vc_activity: datetime | None = None
 _report_generated_today: bool = False
+
+# Voice-connection watchdog: when humans are in a VC but we have no live
+# recording, this marks the moment the unhealthy state began. If it persists
+# past VOICE_STALE_S the watchdog force-tears-down the (zombie) voice client
+# and rejoins. Guards against discord.py voice sockets that die (e.g. WS close
+# 1006) and never auto-recover — the failure mode that caused a ~19h silent
+# outage on 2026-07-03/04.
+_voice_unhealthy_since: datetime | None = None
+VOICE_STALE_S: int = 90
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +188,101 @@ async def _resume_user(user_id: int) -> None:
 
 
 COOLDOWN_CHIME_PATH = Path(__file__).parent / "assets" / "cooldown_chime.wav"
+THINKING_LOOP_PATH = Path(__file__).parent / "assets" / "thinking_loop.wav"
+
+# State for the thinking-loop playback
+_thinking_task: asyncio.Task | None = None
+_thinking_stop: asyncio.Event | None = None
+
+
+async def start_thinking_loop(start_delay_s: float = 2.0, max_duration_s: float = 25.0) -> None:
+    """Play a subtle heartbeat in VC while Ben is processing.
+    - Waits start_delay_s before starting (skips false triggers that clean up fast)
+    - Auto-stops after max_duration_s regardless (safety timeout if no response comes)
+    - Stopped explicitly by stop_thinking_loop() when a response lands
+    """
+    global _thinking_task, _thinking_stop
+    await stop_thinking_loop()
+
+    guild = bot.get_guild(GUILD_ID)
+    if not guild or not guild.voice_client or not guild.voice_client.is_connected():
+        return
+    if not THINKING_LOOP_PATH.exists():
+        return
+
+    _thinking_stop = asyncio.Event()
+
+    async def _loop_runner():
+        import time as _time
+        started_at = _time.monotonic()
+        try:
+            await asyncio.wait_for(_thinking_stop.wait(), timeout=start_delay_s)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        vc = guild.voice_client
+        try:
+            while not _thinking_stop.is_set():
+                # Safety timeout — never play longer than max_duration_s total
+                if _time.monotonic() - started_at > max_duration_s:
+                    log.warning("Thinking loop hit max_duration_s (%.0fs) — auto-stopping", max_duration_s)
+                    try:
+                        if vc.is_connected() and vc.is_playing():
+                            vc.stop()
+                    except Exception:
+                        pass
+                    return
+                if not vc.is_connected():
+                    return
+                if vc.is_playing():
+                    await asyncio.sleep(0.2)
+                    continue
+                try:
+                    source = discord.FFmpegPCMAudio(str(THINKING_LOOP_PATH))
+                    source = discord.PCMVolumeTransformer(source, volume=0.18)
+                    vc.play(source)
+                except Exception:
+                    return
+                while vc.is_playing() and not _thinking_stop.is_set():
+                    if _time.monotonic() - started_at > max_duration_s:
+                        try:
+                            vc.stop()
+                        except Exception:
+                            pass
+                        return
+                    await asyncio.sleep(0.15)
+                if _thinking_stop.is_set() and vc.is_playing():
+                    try:
+                        vc.stop()
+                    except Exception:
+                        pass
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    _thinking_task = asyncio.create_task(_loop_runner())
+
+
+async def stop_thinking_loop() -> None:
+    """Stop the thinking loop if running."""
+    global _thinking_task, _thinking_stop
+    if _thinking_stop is not None:
+        _thinking_stop.set()
+    if _thinking_task is not None:
+        try:
+            await asyncio.wait_for(_thinking_task, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            _thinking_task.cancel()
+    _thinking_task = None
+    _thinking_stop = None
+    # Stop any current playback so it doesn't block TTS
+    guild = bot.get_guild(GUILD_ID)
+    if guild and guild.voice_client and guild.voice_client.is_playing():
+        try:
+            guild.voice_client.stop()
+        except Exception:
+            pass
 
 async def _play_cooldown_chime() -> None:
     """Play a short low-volume descending chime to signal cooldown denial."""
@@ -169,12 +302,43 @@ async def _play_cooldown_chime() -> None:
 
 def _vosk_wake_callback(user_id: int, username: str, text: str) -> None:
     """Called from audio thread when Vosk detects 'benjamin'. Bridge to async."""
+    import duplex_mode
+    if duplex_mode.is_active():
+        _dx = duplex_mode.get()
+        if _dx and _dx.standby and _main_loop and \
+                (not _dx.allowed_users or user_id in _dx.allowed_users):
+            # Standby duplex: wake word brings the mic back instead of cascading.
+            # Works regardless of VC_TRIGGER_ENABLED (that gates the cascade only).
+            trigger_log.info("ACCEPT path=vosk reason=duplex_wake user=%s", username)
+            asyncio.run_coroutine_threadsafe(_dx.wake("wake word"), _main_loop)
+        else:
+            # Live duplex session owns the conversation — skip the cascade.
+            trigger_log.info("REJECT path=vosk reason=duplex_active user=%s", username)
+        return
+    # No active session, but a recent one may have idle-closed — let any VC
+    # member's wake word resurrect it from its saved state (collaborative). Set
+    # DUPLEX_ALLOWED_IDS to restrict who can revive it.
+    _allowed = {int(x) for x in os.getenv("DUPLEX_ALLOWED_IDS", "")
+                .replace(",", " ").split()}
+    if _main_loop and (not _allowed or user_id in _allowed):
+        import duplex_mode as _dm
+        async def _try_resurrect():
+            if await _dm.wake_from_state(bot):
+                trigger_log.info("ACCEPT path=vosk reason=duplex_resurrect user=%s", username)
+        asyncio.run_coroutine_threadsafe(_try_resurrect(), _main_loop)
+    from config import VC_TRIGGER_ENABLED as _VC_ON
+    if not _VC_ON:
+        trigger_log.info("REJECT path=vosk reason=trigger_disabled user=%s", username)
+        return
     if not _main_loop:
         return
+    trigger_log.info("DETECT path=vosk user=%s text=%r", username, text[:200])
     if not check_cooldown(user_id):
+        trigger_log.info("REJECT path=vosk reason=cooldown user=%s", username)
         asyncio.run_coroutine_threadsafe(_play_cooldown_chime(), _main_loop)
         return
     mark_triggered(user_id)
+    trigger_log.info("ACCEPT path=vosk user=%s", username)
     log.info("🔊 VOSK TRIGGER by %s: %s", username, text)
     asyncio.run_coroutine_threadsafe(_vosk_trigger_async(user_id, username, text), _main_loop)
 
@@ -210,11 +374,13 @@ async def _vosk_trigger_async(user_id: int, username: str, text: str) -> None:
         else:
             snippet = f"**{username}: {text}**"
 
-        from triggers import fire_instant_trigger, fetch_and_cache_recent_responses
+        from triggers import fire_instant_trigger, post_processing_placeholder, fetch_and_cache_recent_responses
         await fetch_and_cache_recent_responses(bot, REPORT_CHANNEL_ID)
+        ph_id = await post_processing_placeholder(bot, REPORT_CHANNEL_ID, daily_path=daily_path)
+        await start_thinking_loop()
         ok = await fire_instant_trigger(
             vc_user_ids, daily_path, snippet, full_transcript,
-            username, user_id, 
+            username, user_id, placeholder_message_id=ph_id,
         )
         if not ok:
             write_trigger_file(vc_user_ids, daily_path, snippet, username, user_id)
@@ -246,13 +412,18 @@ async def _play_trigger_chime() -> None:
 async def _stream_wake_word(transcript: str, recent_context: str, trigger_user_id: int = 0, trigger_username: str = "unknown") -> None:
     """Called by per-user streaming transcriber when 'benjamin' detected in real-time."""
     from pathlib import Path
-    from config import RECORDINGS_DIR
+    from config import RECORDINGS_DIR, VC_TRIGGER_ENABLED as _VC_ON
 
+    if not _VC_ON:
+        return
+    trigger_log.info("DETECT path=gcp_stream user=%s text=%r", trigger_username, transcript[:200])
     # Check cooldown
     if not check_cooldown(trigger_user_id):
+        trigger_log.info("REJECT path=gcp_stream reason=cooldown user=%s", trigger_username)
         await _play_cooldown_chime()
         return
 
+    trigger_log.info("ACCEPT path=gcp_stream user=%s", trigger_username)
     log.info("🎤 STREAM TRIGGER by %s", trigger_username)
     mark_triggered(trigger_user_id)
     
@@ -284,13 +455,15 @@ async def _stream_wake_word(transcript: str, recent_context: str, trigger_user_i
             pass
 
     # Fire instant trigger (agent posts its own message)
-    from triggers import fire_instant_trigger, fetch_and_cache_recent_responses
+    from triggers import fire_instant_trigger, post_processing_placeholder, fetch_and_cache_recent_responses
     await fetch_and_cache_recent_responses(bot, REPORT_CHANNEL_ID)
+    ph_id = await post_processing_placeholder(bot, REPORT_CHANNEL_ID, daily_path=daily_path)
+    await start_thinking_loop()
     instant_ok = await fire_instant_trigger(
         vc_user_ids, daily_path, snippet, full_transcript,
-        trigger_username, trigger_user_id, 
+        trigger_username, trigger_user_id, placeholder_message_id=ph_id,
     )
-    
+
     if not instant_ok:
         write_trigger_file(vc_user_ids, daily_path, snippet, trigger_username, trigger_user_id)
 
@@ -371,15 +544,20 @@ async def _join_best_channel_inner() -> None:
         log.warning("Voice client not connected after wait — skipping recording")
         return
 
-    # Start per-user streaming manager
-    if stream_transcriber is None:
-        stream_transcriber = PerUserStreamManager(on_wake_word=_stream_wake_word)
-        log.info("Per-user stream manager created for real-time wake word detection")
+    # GCP STT disabled — credentials restricted (Account Restricted error)
+    # Bot runs AssemblyAI-only mode for transcription
+    stream_transcriber = None
 
-    # Initialize local wake word detector (Vosk, offline)
+    # Initialize local wake word detector (Vosk, offline). Always loaded: the
+    # duplex standby→wake path needs it even when the legacy trigger cascade is
+    # disabled (VC_TRIGGER_ENABLED only gates the cascade, in the callback).
     global wake_detector
+    from config import VC_TRIGGER_ENABLED
     if wake_detector is None:
         wake_detector = LocalWakeWordDetector(on_wake=_vosk_wake_callback)
+        if not VC_TRIGGER_ENABLED:
+            log.info("VC_TRIGGER_ENABLED=false — Vosk loaded for duplex wake only "
+                     "(legacy cascade stays off)")
 
     # Start audio capture via socket listener
     audio_sink = UserAudioSink(bot, stream_transcriber=stream_transcriber, wake_detector=wake_detector)
@@ -441,6 +619,83 @@ async def channel_monitor():
         log.exception("Error in channel monitor")
 
 
+async def _force_voice_reset(guild: discord.Guild) -> None:
+    """Hard-teardown a dead/zombie voice client so the next join starts clean.
+
+    A plain reconnect isn't enough: after the socket dies, discord.py can leave
+    guild.voice_client in a half-state where target.connect() keeps raising
+    'Already connected', so the normal 30s join loop spins forever. Forcing a
+    disconnect + clearing our own voice state on the gateway clears it."""
+    global audio_sink, stream_transcriber
+    try:
+        if audio_sink:
+            audio_sink.cleanup()
+            audio_sink = None
+    except Exception:
+        log.exception("watchdog: audio_sink cleanup failed")
+    try:
+        if stream_transcriber:
+            await stream_transcriber.disconnect_all()
+    except Exception:
+        log.exception("watchdog: stream_transcriber teardown failed")
+    try:
+        if guild.voice_client:
+            await guild.voice_client.disconnect(force=True)
+    except Exception:
+        log.exception("watchdog: force disconnect failed")
+    # Tell the gateway we've left, in case discord.py's client object is stale.
+    try:
+        await guild.change_voice_state(channel=None)
+    except Exception:
+        log.exception("watchdog: change_voice_state(None) failed")
+    # Give Discord a moment to tear the old session down before rejoining.
+    await asyncio.sleep(3)
+
+
+@tasks.loop(seconds=30)
+async def voice_watchdog():
+    """Detect and recover a dead voice connection.
+
+    Healthy = there are no humans to record, OR we have a connected voice
+    client with an active audio sink. If humans ARE present but we have no
+    live recording for longer than VOICE_STALE_S, assume the voice socket is a
+    zombie and force a clean reconnect."""
+    global _voice_unhealthy_since
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        target = _best_voice_channel(guild)
+        vc = guild.voice_client
+        healthy = (target is None) or bool(
+            vc and vc.is_connected() and audio_sink is not None
+        )
+        if healthy:
+            _voice_unhealthy_since = None
+            return
+
+        now = datetime.now(timezone.utc)
+        if _voice_unhealthy_since is None:
+            _voice_unhealthy_since = now
+            log.warning(
+                "watchdog: humans in VC but no live recording — starting stale timer"
+            )
+            return
+
+        elapsed = (now - _voice_unhealthy_since).total_seconds()
+        if elapsed < VOICE_STALE_S:
+            return
+
+        log.error(
+            "watchdog: voice unhealthy for %.0fs — forcing reset + rejoin", elapsed
+        )
+        await _force_voice_reset(guild)
+        await join_best_channel()
+        _voice_unhealthy_since = None
+    except Exception:
+        log.exception("Error in voice watchdog")
+
+
 @tasks.loop(minutes=5)
 async def inactivity_check():
     global _report_generated_today, _last_vc_activity
@@ -489,7 +744,7 @@ async def inactivity_check():
                     headers = {"Authorization": f"Bearer {PASCRIBE_TOKEN}", "Content-Type": "application/json"}
                     async with aiohttp.ClientSession() as session:
                         async with session.post(
-                            f"{PASCRIBE_URL}/api/transcription",
+                            f"{PASCRIBE_URL}/transcript",
                             headers=headers,
                             json=payload,
                             timeout=aiohttp.ClientTimeout(total=60),
@@ -642,7 +897,10 @@ async def auto_transcribe():
                 # Batch wake word: check ONLY the newly transcribed text (not full transcript)
                 if "benjamin" in convo.lower():
                     log.info("Batch wake word found in new transcription (%d chars)", len(convo))
-                    if not check_cooldown(0):
+                    from config import VC_TRIGGER_ENABLED as _VC_ON
+                    if not _VC_ON:
+                        log.info("VC_TRIGGER_ENABLED=false — skipping batch wake-word handler (no chime, no placeholder, no TTS)")
+                    elif not check_cooldown(0):
                         await _play_cooldown_chime()
                     else:
                         mark_triggered(0)
@@ -657,7 +915,8 @@ async def auto_transcribe():
                         full_text = daily_path.read_text(encoding="utf-8") if daily_path.exists() else convo
                         from triggers import fire_instant_trigger, post_processing_placeholder, fetch_and_cache_recent_responses
                         await fetch_and_cache_recent_responses(bot, REPORT_CHANNEL_ID)
-                        ph_id = await post_processing_placeholder(bot, REPORT_CHANNEL_ID)
+                        ph_id = await post_processing_placeholder(bot, REPORT_CHANNEL_ID, daily_path=daily_path)
+                        await start_thinking_loop()
                         ok = await fire_instant_trigger(vc_ids, daily_path, snippet, full_text, placeholder_message_id=ph_id)
                         if not ok:
                             write_trigger_file(vc_ids, daily_path, snippet)
@@ -675,6 +934,20 @@ async def on_ready():
     log.info("Logged in as %s (ID: %d)", bot.user, bot.user.id)
     log.info("Guild target: %d", GUILD_ID)
     log.info("Report channel: %d", REPORT_CHANNEL_ID)
+    import duplex_mode
+    await duplex_mode.setup_http(bot)
+
+    async def _resume_duplex() -> None:
+        # Wait for the VC to reconnect after a restart, then resume any
+        # in-flight duplex session so a pending response callback still reaches
+        # the user by voice (a restart to deploy a fix shouldn't drop the call).
+        for _ in range(60):
+            g = bot.get_guild(GUILD_ID)
+            if g and g.voice_client and g.voice_client.is_connected():
+                await duplex_mode.resume_if_active(bot)
+                return
+            await asyncio.sleep(1)
+    asyncio.create_task(_resume_duplex())
 
     cog = PascribeCog(bot)
     await bot.add_cog(cog)
@@ -688,6 +961,8 @@ async def on_ready():
 
     if not channel_monitor.is_running():
         channel_monitor.start()
+    if not voice_watchdog.is_running():
+        voice_watchdog.start()
     if not inactivity_check.is_running():
         inactivity_check.start()
     if not dave_stats.is_running():
@@ -715,6 +990,130 @@ async def on_ready():
 
 
 @bot.event
+async def on_message(message: discord.Message):
+    """When Ben (OpenClaw) posts in the report channel, synthesize TTS and play in VC."""
+    import duplex_mode
+
+    # --- realtime duplex mode commands (any channel, humans only) ---
+    if not message.author.bot and message.content.startswith("!duplex"):
+        arg = message.content[len("!duplex"):].strip()
+        try:
+            if arg == "off":
+                stopped = await duplex_mode.stop()
+                await message.channel.send("🔇 duplex stopped" if stopped else "no active duplex session")
+            elif arg.startswith("test"):
+                s = duplex_mode.get()
+                if not s:
+                    await message.channel.send("no session — `!duplex` first")
+                else:
+                    await s.speak_update(arg[4:].strip() or
+                                         "The tts project finished a build. All tests pass. "
+                                         "It asks whether to deploy now or wait.")
+                    await message.channel.send("📣 update injected")
+            elif arg == "status":
+                s = duplex_mode.get()
+                if not s:
+                    await message.channel.send("no active duplex session")
+                else:
+                    cost = s.in_tokens / 1e6 * 10 + s.out_tokens / 1e6 * 20
+                    await message.channel.send(
+                        f"live — {s.in_tokens}/{s.out_tokens} audio tok in/out (~${cost:.3f})")
+            else:
+                await duplex_mode.start(bot, message.channel)
+                await message.channel.send("🎙️ duplex live — talk to me. `!duplex off` to stop, "
+                                           "`!duplex test` to fake an update.")
+        except Exception as e:
+            log.exception("duplex command failed")
+            await message.channel.send(f"⚠️ duplex error: {e}")
+        return
+
+    from config import VC_TRIGGER_ENABLED as _VC_ON
+    if not _VC_ON:
+        return
+    if not TTS_ENABLED:
+        return
+    if message.channel.id != REPORT_CHANNEL_ID:
+        return
+    if not message.author.bot:
+        return
+    # Skip our own bot's messages (Benjamin) — only play OpenClaw Ben's responses
+    if bot.user and message.author.id == bot.user.id:
+        return
+    text = message.content
+    if not text or len(text.strip()) < 3:
+        return
+
+    trigger_log.info("RESPONSE_RECEIVED author=%s msg_id=%d chars=%d", message.author.name, message.id, len(text))
+
+    # Stop the thinking loop — response has arrived
+    await stop_thinking_loop()
+
+    # Duplex mode owns the voice: speak the response through the realtime
+    # session instead of GCP TTS (same voice, interruptible).
+    _dx = duplex_mode.get()
+    if _dx is not None:
+        trigger_log.info("TTS_ROUTE=duplex msg_id=%d", message.id)
+        await _dx.speak_update(text, source="Ben response")
+        return
+
+    guild = bot.get_guild(GUILD_ID)
+    if not guild or not guild.voice_client or not guild.voice_client.is_connected():
+        trigger_log.warning("TTS_SKIP reason=not_connected_to_vc msg_id=%d", message.id)
+        log.debug("TTS skipped: not connected to VC")
+        return
+
+    vc = guild.voice_client
+    log.info("🗣️ TTS: synthesizing %d chars from %s", len(text), message.author.name)
+    trigger_log.info("TTS_START msg_id=%d chars=%d", message.id, len(text))
+    _tts_t0 = asyncio.get_running_loop().time()
+
+    # Pick a voice from the pool for variety (different voice each response)
+    chosen_voice = random.choice(TTS_VOICE_POOL) if TTS_VOICE_POOL else TTS_VOICE
+
+    # Synthesize off the event loop to avoid blocking
+    loop = asyncio.get_running_loop()
+    audio_path = await loop.run_in_executor(
+        None,
+        lambda: tts.synthesize(
+            text,
+            voice_name=chosen_voice,
+            speaking_rate=TTS_SPEAKING_RATE,
+            pitch=TTS_PITCH,
+            volume_gain_db=TTS_VOLUME_GAIN_DB,
+        ),
+    )
+    if not audio_path:
+        log.warning("TTS synthesis returned None")
+        trigger_log.error("TTS_FAIL msg_id=%d voice=%s", message.id, chosen_voice)
+        return
+    _synth_ms = int((asyncio.get_running_loop().time() - _tts_t0) * 1000)
+    trigger_log.info("TTS_SYNTH_OK msg_id=%d voice=%s synth_ms=%d file=%s",
+                     message.id, chosen_voice, _synth_ms, audio_path.name)
+
+    try:
+        # Wait for any in-flight chime to finish
+        for _ in range(20):
+            if not vc.is_playing():
+                break
+            await asyncio.sleep(0.1)
+        if vc.is_playing():
+            vc.stop()
+            await asyncio.sleep(0.1)
+
+        source = discord.FFmpegPCMAudio(str(audio_path))
+        source = discord.PCMVolumeTransformer(source, volume=0.45)
+        vc.play(source)
+        log.info("🗣️ TTS playing in VC (%s)", audio_path.name)
+        trigger_log.info("TTS_PLAY_OK msg_id=%d", message.id)
+
+        # Periodic cache cleanup
+        tts.cleanup_cache()
+    except Exception as e:
+        log.exception("Failed to play TTS audio")
+        trigger_log.error("TTS_PLAY_FAIL msg_id=%d error=%r", message.id, str(e)[:200])
+
+
+@bot.event
 async def on_voice_state_update(
     member: discord.Member,
     before: discord.VoiceState,
@@ -725,6 +1124,23 @@ async def on_voice_state_update(
         return
     if not member.bot:
         _last_vc_activity = datetime.now(timezone.utc)
+        # Record VC join/leave/move events for the trigger prompt
+        try:
+            from triggers import record_vc_event
+            name = member.display_name or member.name
+            before_ch = before.channel.name if before.channel else None
+            after_ch = after.channel.name if after.channel else None
+            if before_ch is None and after_ch is not None:
+                record_vc_event(f"{name} joined #{after_ch}")
+            elif before_ch is not None and after_ch is None:
+                record_vc_event(f"{name} left #{before_ch}")
+            elif before_ch != after_ch:
+                record_vc_event(f"{name} moved #{before_ch} → #{after_ch}")
+            # Mute/deafen state changes (optional, less useful)
+            elif before.self_mute != after.self_mute:
+                record_vc_event(f"{name} {'muted' if after.self_mute else 'unmuted'}")
+        except Exception:
+            log.exception("Failed to record VC event")
     await asyncio.sleep(2)
     try:
         await join_best_channel()

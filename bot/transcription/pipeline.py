@@ -16,6 +16,7 @@ from audio.storage import (
     get_all_speech_segments_chronological,
     mark_files_processed,
     concatenate_wav_files,
+    load_speaker_ids,
 )
 from config import PASCRIBE_URL, PASCRIBE_TOKEN, DISCUSSION_GAP_S
 from transcription.assemblyai import transcribe_file
@@ -23,22 +24,39 @@ from transcription.assemblyai import transcribe_file
 log = logging.getLogger(__name__)
 
 
-async def _send_to_pascribe_safe(conversation: str, day_str: str, participants: list):
-    """Fire-and-forget wrapper for Pascribe server."""
+async def _send_to_pascribe_safe(
+    conversation: str, day_str: str, participants: list,
+    *, rich_fields: dict | None = None,
+):
+    """Fire-and-forget wrapper for Pascribe server. `rich_fields` is an
+    optional dict of additional AAI response fields (chapters, utterances,
+    summary, text, audio_duration, etc.) that pascribe-server stores
+    verbatim in the JSON. Downstream (idea-gen `prepare_inputs.py`) uses
+    them when present — without this passthrough, chapters are dropped at
+    the boundary and the chapter-aware extractor path is dead code."""
     try:
-        await send_to_pascribe({
+        payload = {
             "transcript": conversation,
             "date": day_str,
             "participants": participants,
             "source": "benjamin-discord-bot",
-        })
+        }
+        if rich_fields:
+            # Whitelist of useful AAI fields. Skipping `words` (huge, rarely
+            # used) and the lower-level acoustic params.
+            for k in ("chapters", "utterances", "summary", "text",
+                     "audio_duration", "language_code", "confidence",
+                     "auto_highlights_result", "entities"):
+                if rich_fields.get(k) is not None:
+                    payload[k] = rich_fields[k]
+        await send_to_pascribe(payload)
     except Exception:
         log.debug("Pascribe send failed (non-blocking)")
 
 
 async def send_to_pascribe(payload: dict) -> dict:
     """POST transcription data to the Pascribe analysis server."""
-    url = f"{PASCRIBE_URL}/api/transcription"
+    url = f"{PASCRIBE_URL}/transcript"
     headers = {
         "Authorization": f"Bearer {PASCRIBE_TOKEN}",
         "Content-Type": "application/json",
@@ -114,6 +132,18 @@ async def _transcribe_single_segment(username: str, filepath: Path) -> dict | No
         "text": text.strip(),
         "duration_seconds": transcript.get("audio_duration", 0),
         "filepath": filepath,
+        # Preserve the rich AAI fields so the caller can propagate them to
+        # pascribe-server. Per-segment transcripts rarely have meaningful
+        # `chapters` (segments are too short for topic detection) but the
+        # field is plumbed end-to-end now; whenever benjamin moves to a
+        # per-discussion transcribe, this will start carrying real data.
+        "_aai": {
+            k: transcript.get(k) for k in
+            ("chapters", "utterances", "summary",
+             "audio_duration", "language_code", "confidence",
+             "auto_highlights_result", "entities")
+            if transcript.get(k) is not None
+        },
     }
 
 
@@ -274,12 +304,43 @@ async def process_new(date: datetime | None = None) -> dict | None:
 
     conversation = _build_conversation(transcripts)
     total_duration = sum(t.get("duration_seconds", 0) for t in transcripts)
-    participants = list({t["username"] for t in transcripts})
+    participant_usernames = list({t["username"] for t in transcripts})
+    # Resolve each username to its Discord user_id from today's sidecar.
+    # Speakers without an ID in the sidecar (e.g. very old data) get null —
+    # downstream consumers tolerate that.
+    speaker_ids = load_speaker_ids(date)
+    participants = [
+        {"username": u, "user_id": speaker_ids.get(u)}
+        for u in participant_usernames
+    ]
+
+    # Merge AAI rich fields from per-segment responses. For now we only
+    # collect them; once benjamin moves to per-discussion transcribe (one
+    # AAI call instead of N), the chapters from that single call will be
+    # genuinely useful. Until then this propagates per-segment confidence
+    # / entities / language_code aggregates.
+    merged_aai: dict = {}
+    all_chapters: list = []
+    all_utterances: list = []
+    for t in transcripts:
+        for k, v in (t.get("_aai") or {}).items():
+            if k == "chapters" and isinstance(v, list):
+                all_chapters.extend(v)
+            elif k == "utterances" and isinstance(v, list):
+                all_utterances.extend(v)
+            elif k not in merged_aai:
+                merged_aai[k] = v
+    if all_chapters:
+        merged_aai["chapters"] = all_chapters
+    if all_utterances:
+        merged_aai["utterances"] = all_utterances
 
     # Send to Pascribe (fire-and-forget, don't block pipeline)
-    asyncio.create_task(_send_to_pascribe_safe(conversation, day_str, participants))
+    asyncio.create_task(_send_to_pascribe_safe(
+        conversation, day_str, participants, rich_fields=merged_aai
+    ))
 
-    header = f"📅 **{day_str}** — {len(participants)} participant(s) ({', '.join(participants)}), {total_duration/60:.0f} min\n"
+    header = f"📅 **{day_str}** — {len(participants)} participant(s) ({', '.join(participant_usernames)}), {total_duration/60:.0f} min\n"
 
     convo_preview = conversation
     if len(convo_preview) > 1500:

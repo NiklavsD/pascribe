@@ -79,7 +79,6 @@ class SpeechSegmenter:
             else:
                 self._ring.append(frame)
                 if self._in_speech:
-                    self._speech_buf.extend(frame)
                     self._silent_count += 1
                     if self._silent_count >= SILENCE_FRAMES:
                         # End of speech segment

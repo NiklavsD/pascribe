@@ -16,6 +16,25 @@ BASE_URL = "https://api.assemblyai.com/v2"
 HEADERS = {"authorization": ASSEMBLYAI_API_KEY}
 
 
+async def _raise_with_body(resp: aiohttp.ClientResponse) -> None:
+    """Like resp.raise_for_status() but logs the response body first.
+
+    AssemblyAI's 4xx responses carry a JSON `{"error": "..."}` that
+    explains *why* — without this, all we see in the journal is a generic
+    `400 Bad Request` stack trace and the actual cause (e.g. negative
+    account balance) is invisible.
+    """
+    if resp.status < 400:
+        return
+    try:
+        body = await resp.text()
+    except Exception:
+        body = "<unreadable>"
+    log.error("AssemblyAI %s %s -> HTTP %d body=%s",
+              resp.method, resp.url.path, resp.status, body[:500])
+    resp.raise_for_status()
+
+
 async def upload_file(filepath: Path) -> str:
     """Upload a local audio file to AssemblyAI. Returns the upload URL."""
     async with aiohttp.ClientSession() as session:
@@ -26,7 +45,7 @@ async def upload_file(filepath: Path) -> str:
             headers={**HEADERS, "content-type": "application/octet-stream"},
             data=data,
         ) as resp:
-            resp.raise_for_status()
+            await _raise_with_body(resp)
             result = await resp.json()
             return result["upload_url"]
 
@@ -37,16 +56,22 @@ async def transcribe(audio_url: str) -> dict:
         # Submit
         payload = {
             "audio_url": audio_url,
-            "speech_models": ["universal-3-pro", "universal-2"],
+            "speech_models": ["universal-3-5-pro", "universal-2"],
             "language_detection": True,
             "speaker_labels": True,
+            # auto_chapters → AAI segments into topic-coherent chapters with
+            # per-chapter `summary` / `headline` / `gist` + start/end ms.
+            # Used downstream by idea-gen prepare_inputs.py to chunk by topic
+            # instead of arbitrary 80K-char windows. (Mutually exclusive with
+            # `summarization`, which is why we don't enable both.)
+            "auto_chapters": True,
         }
         async with session.post(
             f"{BASE_URL}/transcript",
             headers={**HEADERS, "content-type": "application/json"},
             json=payload,
         ) as resp:
-            resp.raise_for_status()
+            await _raise_with_body(resp)
             result = await resp.json()
             transcript_id = result["id"]
 
@@ -57,7 +82,7 @@ async def transcribe(audio_url: str) -> dict:
         while True:
             await asyncio.sleep(3)
             async with session.get(poll_url, headers=HEADERS) as resp:
-                resp.raise_for_status()
+                await _raise_with_body(resp)
                 result = await resp.json()
 
             status = result["status"]

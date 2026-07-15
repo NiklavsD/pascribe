@@ -89,29 +89,21 @@ class LocalWakeWordDetector:
                 if self._is_valid_trigger(text):
                     log.info("🔊 Vosk WAKE WORD [%s]: %s", self._usernames.get(user_id, "?"), text)
                     self._check_keyword(user_id, text)
-        else:
-            # Check partials too for speed, but with stricter validation
-            partial = json.loads(rec.PartialResult())
-            text = partial.get("partial", "")
-            if KEYWORD in text.lower() and self._is_valid_trigger(text):
-                log.info("🔊 Vosk WAKE WORD (partial) [%s]: %s", 
-                        self._usernames.get(user_id, "?"), text)
-                self._check_keyword(user_id, text)
-                rec.Reset()
+        # Note: partial-result triggering removed — too noisy. Only fire on final.
     
     def _is_valid_trigger(self, text: str) -> bool:
-        """Filter out false positives — require 'benjamin' near the start or as a standalone call."""
+        """Filter out false positives — accept any final result containing 'benjamin' as a word.
+
+        Final results from Vosk are already quality-filtered, so we just need to make sure
+        it's not an obvious noise pattern.
+        """
         words = text.lower().split()
         if KEYWORD not in words:
             return False
-        idx = words.index(KEYWORD)
-        # Benjamin must be within first 3 words (e.g. "hey benjamin", "benjamin can you")
-        # OR the total phrase is short (≤5 words = likely a direct call)
-        if idx <= 2 or len(words) <= 5:
-            return True
-        # Long garbled text with "benjamin" buried deep = probably noise
-        log.debug("Vosk rejected (keyword at position %d in %d words): %s", idx, len(words), text)
-        return False
+        # Reject single-word "benjamin" alone (often Vosk noise from silence)
+        if len(words) < 2:
+            return False
+        return True
 
     def _check_keyword(self, user_id: int, text: str) -> None:
         if self._on_wake:
