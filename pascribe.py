@@ -12,6 +12,7 @@ import json
 import wave
 import logging
 import subprocess
+import http.client
 import urllib.request
 import urllib.error
 from collections import deque
@@ -26,6 +27,38 @@ import pyperclip
 from PIL import Image, ImageDraw
 from pystray import Icon, MenuItem, Menu
 
+from pascribe_app import __version__
+from pascribe_app.audio_processing import (
+    ProcessingCancelled,
+    build_segment_map,
+    energy_vad_from_reader,
+    format_ssmd as format_transcript,
+    remap_to_original,
+    resample as resample_audio,
+    write_wav_segments,
+)
+from pascribe_app.diagnostics import collect_diagnostics, format_diagnostics
+from pascribe_app.jobs import ExclusiveJobRunner, LatestJobRunner
+from pascribe_app.paths import (
+    build_app_paths,
+    prepare_app_paths,
+    resolve_recording_path,
+)
+from pascribe_app.recordings import assign_speaker, open_daily_snapshot
+from pascribe_app.secrets import config_for_disk, hydrate_config_secrets
+from pascribe_app.storage import atomic_write_json, load_json
+from pascribe_app.transcription import group_timed_words
+from pascribe_app.validation import normalize_config, validate_settings
+
+
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+APP_PATHS = build_app_paths(APP_DIR)
+_MIGRATED_FILES = prepare_app_paths(APP_PATHS)
+
 # ─── CUDA DLL fix (Windows) ──────────────────────────────────────────────────
 # pip-installed nvidia-cublas-cu12 / nvidia-cudnn-cu12 put DLLs in site-packages
 # but Windows doesn't know to look there. Add them to PATH before CTranslate2 loads.
@@ -37,7 +70,7 @@ if sys.platform == "win32":
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
-LOG_PATH = Path(__file__).parent / "pascribe.log"
+LOG_PATH = APP_PATHS.log
 
 def setup_logging():
     """Configure logging. Routes to file under pythonw, console otherwise."""
@@ -61,10 +94,12 @@ def setup_logging():
 
 setup_logging()
 log = logging.getLogger("pascribe")
+for _migrated_file in _MIGRATED_FILES:
+    log.info(f"Migrated legacy {_migrated_file} to {APP_PATHS.data_dir}")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_PATH = APP_PATHS.config
 DEFAULT_CONFIG = {
     "mic_device": None,
     "mic_device_name": None,
@@ -82,57 +117,66 @@ DEFAULT_CONFIG = {
     "history_max_entries": 100,
     # Daily recording
     "daily_recording": False,
-    "recording_path": "recordings",
+    "recording_path": str(APP_PATHS.recordings),
     "assemblyai_key": "",
     "homelab_url": None,
     "delete_after_transcribe": False,
 }
 
 def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg = json.load(f)
-        for k, v in DEFAULT_CONFIG.items():
-            cfg.setdefault(k, v)
-        return cfg
-    return DEFAULT_CONFIG.copy()
+    result = load_json(CONFIG_PATH, dict)
+    stored, had_plaintext_secret = hydrate_config_secrets(result.data)
+    cfg, warnings = normalize_config(stored, DEFAULT_CONFIG)
+    if result.recovered:
+        suffix = f" Backup: {result.backup_path}" if result.backup_path else ""
+        log.warning(f"Invalid config recovered with defaults.{suffix}")
+    for warning in warnings:
+        log.warning(warning)
+    if had_plaintext_secret:
+        save_config(cfg)
+        log.info("Protected the AssemblyAI key with Windows DPAPI")
+    return cfg
 
 def save_config(cfg: dict):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    with _storage_lock:
+        atomic_write_json(CONFIG_PATH, config_for_disk(cfg))
 
+_storage_lock = threading.RLock()
 config = load_config()
 
 # ─── History Storage ──────────────────────────────────────────────────────────
 
-HISTORY_PATH = Path(__file__).parent / "history.json"
+HISTORY_PATH = APP_PATHS.history
 
 def load_history() -> list:
-    if HISTORY_PATH.exists():
-        try:
-            with open(HISTORY_PATH, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return []
-    return []
+    with _storage_lock:
+        result = load_json(HISTORY_PATH, list)
+    if result.recovered:
+        log.warning(f"Invalid history file preserved at {result.backup_path}")
+    return result.data if isinstance(result.data, list) else []
 
 def save_history(history: list):
-    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
+    with _storage_lock:
+        atomic_write_json(HISTORY_PATH, history)
 
 def add_history_entry(minutes: int, word_count: int, elapsed: float, text: str):
-    history = load_history()
-    history.append({
-        "timestamp": datetime.now().isoformat(),
-        "minutes": minutes,
-        "word_count": word_count,
-        "elapsed_seconds": round(elapsed, 1),
-        "text": text,
-    })
-    max_entries = config.get("history_max_entries", 100)
-    if len(history) > max_entries:
-        history = history[-max_entries:]
-    save_history(history)
+    with _storage_lock:
+        history = load_history()
+        history.append({
+            "timestamp": datetime.now().isoformat(),
+            "minutes": minutes,
+            "word_count": word_count,
+            "elapsed_seconds": round(elapsed, 1),
+            "text": text,
+        })
+        max_entries = config.get("history_max_entries", 100)
+        if len(history) > max_entries:
+            history = history[-max_entries:]
+        save_history(history)
+
+
+def get_recording_path() -> Path:
+    return resolve_recording_path(config.get("recording_path"), APP_PATHS)
 
 # ─── Device Listing ──────────────────────────────────────────────────────────
 
@@ -201,6 +245,26 @@ def categorize_device(name: str) -> str:
         return "Microphone"
     return "Other"
 
+
+def measure_input_device(device_id: int, duration_seconds: float = 0.75) -> tuple[float, int]:
+    """Capture a short sample and return (normalized level, sample rate)."""
+    info = sd.query_devices(device_id)
+    sample_rate = int(info["default_samplerate"])
+    channels = max(1, min(2, int(info["max_input_channels"])))
+    frames = max(1, int(sample_rate * duration_seconds))
+    with sd.InputStream(
+        device=device_id,
+        samplerate=sample_rate,
+        channels=channels,
+        dtype="float32",
+    ) as stream:
+        audio, overflowed = stream.read(frames)
+    if overflowed:
+        log.warning(f"Overflow while testing input device {device_id}")
+    mono = audio.mean(axis=1) if audio.ndim > 1 else audio
+    rms = float(np.sqrt(np.mean(np.square(mono)))) if len(mono) else 0.0
+    return min(1.0, rms * 12), sample_rate
+
 # ─── Audio Buffer ─────────────────────────────────────────────────────────────
 
 CHUNK_SECONDS = 1
@@ -232,6 +296,12 @@ class AudioBuffer:
         with self.lock:
             return len(self.chunks) * CHUNK_SECONDS
 
+    def resize(self, max_chunks: int) -> None:
+        with self.lock:
+            self.max_chunks = max(1, int(max_chunks))
+            while len(self.chunks) > self.max_chunks:
+                self.chunks.popleft()
+
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
 max_chunks = config["buffer_minutes"] * 60 // CHUNK_SECONDS
@@ -239,33 +309,75 @@ mic_buffer = AudioBuffer(max_chunks=max_chunks)
 loopback_buffer = AudioBuffer(max_chunks=max_chunks)
 transcriber = None
 _whisper_lock = threading.Lock()
+_whisper_inference_lock = threading.Lock()
 tray_icon = None
 last_transcript = ""
-_current_cancel = threading.Event()
-_cancel_lock = threading.Lock()
 _main_panel_open = False
 _main_panel_window = None   # tk.Tk reference for the open panel
 _main_panel_notebook = None  # ttk.Notebook reference for tab switching
 _paused = False
-_transcribing = False
-_transcribing_lock = threading.Lock()
 daily_recorder = None
 _instance_lock = None  # socket held to prevent multiple instances
+_quick_jobs = None
+_quick_jobs_init_lock = threading.Lock()
+_daily_jobs = ExclusiveJobRunner(name="pascribe-daily-transcription")
+_activity_lock = threading.Lock()
+_activity_states: dict[str, tuple[str, float | None, int]] = {}
+_activity_sequence = 0
+_tray_error_until = 0.0
+_mic_level = 0.0
+_system_level = 0.0
+
+
+def set_activity(
+    message: str,
+    progress: float | None = None,
+    *,
+    source: str,
+) -> None:
+    global _activity_sequence
+    with _activity_lock:
+        _activity_sequence += 1
+        _activity_states[source] = (message, progress, _activity_sequence)
+
+
+def clear_activity(source: str) -> None:
+    with _activity_lock:
+        _activity_states.pop(source, None)
+
+
+def get_activity() -> tuple[str, float | None]:
+    with _activity_lock:
+        if not _activity_states:
+            return "Ready", None
+        message, progress, _sequence = max(
+            _activity_states.values(),
+            key=lambda state: state[2],
+        )
+        return message, progress
+
+
+def _progress_activity(value: float | None, message: str) -> None:
+    set_activity(message, value, source="daily")
 
 # ─── Audio Capture ────────────────────────────────────────────────────────────
 
 def mic_callback(indata, frames, time_info, status):
+    global _mic_level
     if status:
         log.warning(f"Mic status: {status}")
     mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
+    _mic_level = min(1.0, float(np.sqrt(np.mean(np.square(mono)))) * 12) if len(mono) else 0.0
     mic_buffer.add_chunk(mono)
     if daily_recorder:
         daily_recorder.write_mic(mono, mic_buffer.capture_rate)
 
 def loopback_callback(indata, frames, time_info, status):
+    global _system_level
     if status:
         log.warning(f"Loopback status: {status}")
     mono = indata.mean(axis=1) if indata.ndim > 1 else indata.flatten()
+    _system_level = min(1.0, float(np.sqrt(np.mean(np.square(mono)))) * 12) if len(mono) else 0.0
     loopback_buffer.add_chunk(mono)
     if daily_recorder:
         daily_recorder.write_sys(mono, loopback_buffer.capture_rate)
@@ -341,8 +453,9 @@ def start_audio_streams():
     save_config(config)
 
     if config.get("daily_recording"):
-        daily_recorder = DailyAudioRecorder(config.get("recording_path", "recordings"))
-        log.info(f"Daily recording -> {config.get('recording_path', 'recordings')}/")
+        recording_path = get_recording_path()
+        daily_recorder = DailyAudioRecorder(str(recording_path))
+        log.info(f"Daily recording -> {recording_path}")
 
     return streams
 
@@ -359,7 +472,7 @@ def _check_vram(model_name: str) -> tuple[bool, str]:
     try:
         import torch
         if not torch.cuda.is_available():
-            return True, ""  # CPU mode, no VRAM concern
+            return True, ""
         free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
         needed_mb = WHISPER_VRAM_MB.get(model_name, 3200) + VRAM_SAFETY_MARGIN_MB
         if free_mb < needed_mb:
@@ -369,7 +482,34 @@ def _check_vram(model_name: str) -> tuple[bool, str]:
             )
         return True, ""
     except ImportError:
-        return True, ""  # No torch = likely CPU mode
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.free",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            free_values = [
+                float(line.strip())
+                for line in result.stdout.splitlines()
+                if line.strip()
+            ]
+            if free_values:
+                free_mb = max(free_values)
+                needed_mb = WHISPER_VRAM_MB.get(model_name, 3200) + VRAM_SAFETY_MARGIN_MB
+                if free_mb < needed_mb:
+                    return False, (
+                        f"Not enough VRAM: {free_mb:.0f} MB free, "
+                        f"~{needed_mb:.0f} MB needed for {model_name}"
+                    )
+        except Exception:
+            pass
+        return True, ""
     except Exception as e:
         log.warning(f"VRAM check failed: {e}")
         return True, ""  # Don't block on check failure
@@ -417,70 +557,43 @@ WHISPER_HALLUCINATIONS = {
 }
 
 def transcribe_audio(
-    audio: np.ndarray, cancel_event: threading.Event | None = None
+    audio: np.ndarray | str | Path,
+    cancel_event: threading.Event | None = None,
 ) -> list[tuple[float, float, str]]:
-    """Transcribe numpy audio array. Returns list of (start, end, text) tuples."""
-    init_whisper()
-
-    segments, info = transcriber.transcribe(
-        audio,
-        beam_size=5,
-        language=None,  # Auto-detect
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-    )
-
-    result = []
-    for segment in segments:
+    """Run one isolated Whisper lifecycle and return timestamped segments."""
+    with _whisper_inference_lock:
         if cancel_event and cancel_event.is_set():
-            log.info("Transcription cancelled")
             return []
-        text = segment.text.strip()
-        if text:
-            result.append((segment.start, segment.end, text))
+        try:
+            init_whisper()
+            segments, _info = transcriber.transcribe(
+                str(audio) if isinstance(audio, Path) else audio,
+                beam_size=5,
+                language=None,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+            )
 
-    # Filter hallucinations: if the entire transcription is just a known
-    # hallucination phrase, discard it
-    if result:
-        all_text = " ".join(t for _, _, t in result).strip().lower()
-        all_text = all_text.strip(".,!?")
-        if all_text in WHISPER_HALLUCINATIONS:
-            log.info(f"Filtered hallucination: '{all_text}'")
-            return []
+            result = []
+            for segment in segments:
+                if cancel_event and cancel_event.is_set():
+                    log.info("Transcription cancelled")
+                    return []
+                text = segment.text.strip()
+                if text:
+                    result.append((segment.start, segment.end, text))
 
-    return result
+            if result:
+                all_text = " ".join(text for _, _, text in result).strip().lower()
+                all_text = all_text.strip(".,!?")
+                if all_text in WHISPER_HALLUCINATIONS:
+                    log.info(f"Filtered hallucination: '{all_text}'")
+                    return []
+            return result
+        finally:
+            if transcriber is not None:
+                unload_whisper()
 
-
-def format_ssmd(segments: list[tuple[float, float, str]], pause_threshold: float = 2.0) -> str:
-    """Format transcription segments as timestamped text with paragraph breaks on pauses."""
-    if not segments:
-        return ""
-
-    lines = []
-    prev_end = None
-
-    for start, end, text in segments:
-        # Insert paragraph break on significant pause
-        if prev_end is not None and (start - prev_end) > pause_threshold:
-            lines.append("")
-
-        mins = int(start) // 60
-        secs = int(start) % 60
-        lines.append(f"[{mins:02d}:{secs:02d}] {text}")
-        prev_end = end
-
-    return "\n".join(lines)
-
-# ─── Resampling ──────────────────────────────────────────────────────────────
-
-def _resample(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-    """Resample audio from src_rate to dst_rate using linear interpolation."""
-    if src_rate == dst_rate:
-        return audio
-    ratio = dst_rate / src_rate
-    new_len = int(len(audio) * ratio)
-    indices = np.linspace(0, len(audio) - 1, new_len)
-    return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
 
 # ─── Daily Audio Recording ────────────────────────────────────────────────────
 
@@ -511,7 +624,7 @@ class DailyAudioRecorder:
     def _write(self, stream: str, data: np.ndarray, capture_rate: int):
         today = date.today().isoformat()
         if capture_rate != self.STORE_RATE:
-            data = _resample(data, capture_rate, self.STORE_RATE)
+            data = resample_audio(data, capture_rate, self.STORE_RATE)
         with self._lock:
             if today != self._current_date:
                 self._rotate(today)
@@ -533,8 +646,7 @@ class DailyAudioRecorder:
             # New day: write int16 (half the storage of float32)
             self._write_dtype = "int16"
             meta = {"started": datetime.now().isoformat(), "sample_rate": self.STORE_RATE, "dtype": "int16"}
-            with open(meta_path, "w") as f:
-                json.dump(meta, f)
+            atomic_write_json(meta_path, meta)
             log.info(f"Daily recording started: {day_dir}")
         else:
             # Resume: match whatever dtype the existing file uses
@@ -560,142 +672,21 @@ class DailyAudioRecorder:
         with self._lock:
             self._close()
 
+    def flush_and_get_sample_limits(self, day: str) -> dict[str, int]:
+        """Flush active handles and return stable sample counts for a snapshot."""
+        with self._lock:
+            for handle in (self._mic_fh, self._sys_fh):
+                if handle:
+                    handle.flush()
+            day_dir = self.recording_path / day
+            dtype = np.dtype(self._write_dtype)
+            limits: dict[str, int] = {}
+            for stream, name in (("mic", "mic.raw"), ("sys", "sys.raw")):
+                path = day_dir / name
+                if path.exists():
+                    limits[stream] = path.stat().st_size // dtype.itemsize
+            return limits
 
-def load_todays_recordings() -> tuple[np.ndarray | None, np.ndarray | None, datetime | None, int]:
-    """Load today's mic and system audio from disk.
-    Returns (mic_audio, sys_audio, start_time, sample_rate).
-    """
-    rec_path = Path(config.get("recording_path", "recordings"))
-    today = date.today().isoformat()
-    day_dir = rec_path / today
-
-    if not day_dir.exists():
-        return None, None, None, 16000
-
-    meta_path = day_dir / "meta.json"
-    if not meta_path.exists():
-        return None, None, None, 16000
-
-    with open(meta_path) as f:
-        meta = json.load(f)
-
-    sample_rate = meta.get("sample_rate", 16000)
-    started = datetime.fromisoformat(meta["started"])
-
-    raw_dtype = np.dtype(meta.get("dtype", "float32"))
-
-    def load_raw(name: str) -> np.ndarray | None:
-        p = day_dir / name
-        if not p.exists() or p.stat().st_size == 0:
-            return None
-        audio = np.frombuffer(p.read_bytes(), dtype=raw_dtype).copy()
-        if raw_dtype == np.dtype("int16"):
-            audio = audio.astype(np.float32) / 32767.0
-        return audio
-
-    return load_raw("mic.raw"), load_raw("sys.raw"), started, sample_rate
-
-
-def _energy_vad(audio: np.ndarray, sample_rate: int,
-                frame_ms: int = 30,
-                min_speech_s: float = 0.4,
-                pad_s: float = 0.3) -> list[tuple[float, float]]:
-    """Energy-based VAD. Returns list of (start_s, end_s) speech segments.
-
-    Uses an adaptive threshold (fraction of top-energy frames) so it works
-    across quiet and loud environments without manual tuning.
-    """
-    frame_samples = int(sample_rate * frame_ms / 1000)
-    if len(audio) < frame_samples:
-        return []
-
-    n_frames = len(audio) // frame_samples
-    frames_rms = np.array([
-        np.sqrt(np.mean(audio[i * frame_samples:(i + 1) * frame_samples] ** 2))
-        for i in range(n_frames)
-    ])
-
-    if frames_rms.max() == 0:
-        return []
-
-    # Adaptive: threshold is 15% of the median of the loudest 20% of frames,
-    # floored at a tiny noise floor so silence-only recordings don't hallucinate speech.
-    top_20 = np.sort(frames_rms)[int(n_frames * 0.8):]
-    threshold = max(np.median(top_20) * 0.15, 1e-4)
-
-    is_speech = frames_rms > threshold
-
-    # Fill short gaps (< 500 ms) so words don't get split
-    gap_fill = int(500 / frame_ms)
-    for i in range(len(is_speech) - gap_fill):
-        if is_speech[i] and is_speech[i + gap_fill]:
-            is_speech[i:i + gap_fill] = True
-
-    # Extract contiguous regions, add padding
-    pad_frames = int(pad_s * 1000 / frame_ms)
-    segments: list[list[float]] = []
-    in_speech = False
-    seg_start = 0
-
-    for i, speech in enumerate(is_speech):
-        if speech and not in_speech:
-            seg_start = max(0, i - pad_frames)
-            in_speech = True
-        elif not speech and in_speech:
-            seg_end = min(n_frames - 1, i + pad_frames)
-            dur = (seg_end - seg_start) * frame_ms / 1000
-            if dur >= min_speech_s:
-                segments.append([seg_start * frame_ms / 1000, seg_end * frame_ms / 1000])
-            in_speech = False
-
-    if in_speech:
-        seg_end = n_frames - 1
-        dur = (seg_end - seg_start) * frame_ms / 1000
-        if dur >= min_speech_s:
-            segments.append([seg_start * frame_ms / 1000, seg_end * frame_ms / 1000])
-
-    # Merge overlapping segments
-    merged: list[list[float]] = []
-    for seg in segments:
-        if merged and seg[0] <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], seg[1])
-        else:
-            merged.append(seg)
-
-    max_s = len(audio) / sample_rate
-    return [(float(s[0]), float(min(s[1], max_s))) for s in merged]
-
-
-def _build_segment_map(vad_segs: list[tuple[float, float]]) -> list[tuple[float, float, float]]:
-    """Build a map from stripped-audio time → original-audio time.
-    Returns list of (stripped_start, stripped_end, orig_start).
-    """
-    seg_map = []
-    t = 0.0
-    for orig_start, orig_end in vad_segs:
-        dur = orig_end - orig_start
-        seg_map.append((t, t + dur, orig_start))
-        t += dur
-    return seg_map
-
-
-def _remap_to_original(t: float, seg_map: list[tuple[float, float, float]]) -> float:
-    """Convert a stripped-audio timestamp back to original-audio timestamp."""
-    for strip_start, strip_end, orig_start in seg_map:
-        if strip_start <= t <= strip_end:
-            return orig_start + (t - strip_start)
-    return t
-
-
-def _assign_speaker(start_s: float, end_s: float,
-                    mic_audio: np.ndarray, sys_audio: np.ndarray,
-                    sample_rate: int) -> str:
-    """Determine speaker by comparing RMS energy in mic vs system streams."""
-    s = int(start_s * sample_rate)
-    e = int(end_s * sample_rate)
-    mic_rms = float(np.sqrt(np.mean(mic_audio[s:min(e, len(mic_audio))] ** 2))) if s < len(mic_audio) else 0.0
-    sys_rms = float(np.sqrt(np.mean(sys_audio[s:min(e, len(sys_audio))] ** 2))) if s < len(sys_audio) else 0.0
-    return "you" if mic_rms >= sys_rms else "discord"
 
 # ─── AssemblyAI ───────────────────────────────────────────────────────────────
 
@@ -713,30 +704,77 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
-def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict]:
+def _upload_wav_path(
+    path: Path,
+    api_key: str,
+    cancel_event: threading.Event | None = None,
+    progress=None,
+) -> str:
+    """Stream a WAV from disk so multi-hour audio is never duplicated in RAM."""
+    file_size = path.stat().st_size
+    connection = http.client.HTTPSConnection("api.assemblyai.com", timeout=60)
+    sent = 0
+    try:
+        connection.putrequest("POST", "/v2/upload")
+        connection.putheader("authorization", api_key)
+        connection.putheader("content-type", "application/octet-stream")
+        connection.putheader("content-length", str(file_size))
+        connection.endheaders()
+        with path.open("rb") as handle:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ProcessingCancelled("Upload cancelled")
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                connection.send(chunk)
+                sent += len(chunk)
+                if progress is not None:
+                    progress(sent / file_size if file_size else 1.0, "Uploading speech audio")
+        response = connection.getresponse()
+        body = response.read().decode("utf-8", errors="replace")
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"AssemblyAI upload {response.status}: {body[:400]}")
+        return json.loads(body)["upload_url"]
+    finally:
+        connection.close()
+
+
+def transcribe_with_assemblyai(
+    audio: np.ndarray | str | Path,
+    sample_rate: int,
+    cancel_event: threading.Event | None = None,
+    progress=None,
+) -> list[dict]:
     """Upload VAD-stripped audio to AssemblyAI, poll until done, return segments.
     Each segment: {start_s, end_s, text}.
     """
     api_key = config.get("assemblyai_key", "")
     if not api_key:
-        raise RuntimeError("assemblyai_key not configured in config.json")
+        raise RuntimeError("AssemblyAI key is not configured in Settings")
 
-    wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
-    log.info(f"Uploading {len(wav_bytes) / 1024 / 1024:.1f} MB to AssemblyAI...")
+    if isinstance(audio, (str, Path)):
+        wav_path = Path(audio)
+        log.info(f"Uploading {wav_path.stat().st_size / 1024 / 1024:.1f} MB to AssemblyAI...")
+        upload_url = _upload_wav_path(wav_path, api_key, cancel_event, progress)
+    else:
+        wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
+        log.info(f"Uploading {len(wav_bytes) / 1024 / 1024:.1f} MB to AssemblyAI...")
+
+        request = urllib.request.Request(
+            f"{ASSEMBLYAI_BASE}/upload",
+            data=wav_bytes,
+            headers={"authorization": api_key, "content-type": "application/octet-stream"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                upload_url = json.loads(response.read())["upload_url"]
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"AssemblyAI upload {error.code}: {body[:400]}")
 
     hdrs_json = {"authorization": api_key, "content-type": "application/json"}
-    hdrs_bin  = {"authorization": api_key, "content-type": "application/octet-stream"}
-
-    # 1. Upload
-    req = urllib.request.Request(
-        f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes, headers=hdrs_bin, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req) as r:
-            upload_url = json.loads(r.read())["upload_url"]
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"AssemblyAI upload {e.code}: {body[:400]}")
 
     # 2. Submit transcription job
     body = json.dumps({"audio_url": upload_url, "language_detection": True}).encode()
@@ -744,7 +782,7 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
         f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
     )
     try:
-        with urllib.request.urlopen(req) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:
             transcript_id = json.loads(r.read())["id"]
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -754,9 +792,11 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
     # 3. Poll
     poll_url = f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}"
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessingCancelled("Daily transcription cancelled")
         req = urllib.request.Request(poll_url, headers={"authorization": api_key})
         try:
-            with urllib.request.urlopen(req) as r:
+            with urllib.request.urlopen(req, timeout=60) as r:
                 result = json.loads(r.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
@@ -767,33 +807,15 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
         elif status == "error":
             raise RuntimeError(f"AssemblyAI error: {result.get('error', 'unknown')}")
         log.info(f"AssemblyAI: {status}...")
-        time.sleep(5)
+        if progress is not None:
+            progress(None, f"AssemblyAI: {status}")
+        if cancel_event is not None:
+            if cancel_event.wait(5):
+                raise ProcessingCancelled("Daily transcription cancelled")
+        else:
+            time.sleep(5)
 
-    # 4. Group words into utterances by pause threshold
-    words = result.get("words", [])
-    if not words:
-        return []
-
-    PAUSE_MS = 1200
-    segments: list[dict] = []
-    buf: list[str] = []
-    seg_start_s = words[0]["start"] / 1000.0
-
-    for i, w in enumerate(words):
-        buf.append(w["text"])
-        is_last = i == len(words) - 1
-        gap = 0 if is_last else words[i + 1]["start"] - w["end"]
-        if is_last or gap > PAUSE_MS:
-            segments.append({
-                "start_s": seg_start_s,
-                "end_s": w["end"] / 1000.0,
-                "text": " ".join(buf),
-            })
-            buf = []
-            if not is_last:
-                seg_start_s = words[i + 1]["start"] / 1000.0
-
-    return segments
+    return group_timed_words(result.get("words", []))
 
 
 def post_to_homelab(data: dict, url: str):
@@ -808,40 +830,65 @@ def post_to_homelab(data: dict, url: str):
 # ─── Daily Transcription ──────────────────────────────────────────────────────
 
 def run_daily_transcription():
-    """Trigger daily transcription in a background thread (called from tray)."""
-    threading.Thread(target=_daily_transcription_worker, daemon=True).start()
+    """Start one cancellable daily job and reject accidental duplicates."""
+    started = _daily_jobs.start(_daily_transcription_worker)
+    if not started:
+        notify("Daily transcription is already running")
+        log.info("Ignored duplicate daily transcription request")
+    return started
 
 
-def _daily_transcription_worker():
+def cancel_daily_transcription():
+    cancelled = _daily_jobs.cancel()
+    if cancelled:
+        set_activity("Cancelling daily transcription…", source="daily")
+        notify("Cancelling daily transcription…")
+    return cancelled
+
+
+def _daily_transcription_worker(cancel_event: threading.Event):
+    snapshot = None
+    speech_wav: Path | None = None
     try:
-        update_tray_icon("yellow")
+        set_activity("Loading today's recordings…", 0.0, source="daily")
+        refresh_tray_icon()
         notify("Loading today's recordings...")
 
-        mic_audio, sys_audio, started, sample_rate = load_todays_recordings()
-
-        if mic_audio is None and sys_audio is None:
+        today = date.today().isoformat()
+        recording_path = get_recording_path()
+        sample_limits = (
+            daily_recorder.flush_and_get_sample_limits(today)
+            if daily_recorder is not None
+            else None
+        )
+        snapshot = open_daily_snapshot(
+            recording_path,
+            today,
+            sample_limits=sample_limits,
+        )
+        if snapshot is None or snapshot.total_samples == 0:
             notify("No recordings found — enable Daily Recording in Settings")
-            update_tray_icon("green")
             return
 
-        has_both = mic_audio is not None and sys_audio is not None
+        sample_rate = snapshot.sample_rate
+        duration_s = snapshot.total_samples / sample_rate
+        reader = snapshot.mixed_reader()
+        log.info(
+            f"Daily audio snapshot: {duration_s / 3600:.1f}h "
+            f"from {snapshot.started.strftime('%H:%M')}"
+        )
 
-        if has_both:
-            min_len = min(len(mic_audio), len(sys_audio))
-            mix = mic_audio[:min_len] * 0.5 + sys_audio[:min_len] * 0.5
-        else:
-            mix = mic_audio if mic_audio is not None else sys_audio
-
-        duration_s = len(mix) / sample_rate
-        log.info(f"Daily audio: {duration_s / 3600:.1f}h from {started.strftime('%H:%M')}")
-
-        # VAD pre-strip to cut API costs
         notify("VAD pre-processing...")
-        vad_segs = _energy_vad(mix, sample_rate)
+        vad_segs = energy_vad_from_reader(
+            reader,
+            snapshot.total_samples,
+            sample_rate,
+            cancel_event=cancel_event,
+            progress=lambda value, message: _progress_activity(value * 0.2, message),
+        )
 
         if not vad_segs:
             notify("No speech detected in today's recordings")
-            update_tray_icon("green")
             return
 
         total_speech_s = sum(e - s for s, e in vad_segs)
@@ -851,54 +898,86 @@ def _daily_transcription_worker():
             f"{duration_s / 60:.1f} min total ({pct:.0f}%)"
         )
 
-        # Build stripped audio + segment map for timestamp remapping
-        chunks = [mix[int(s * sample_rate):int(e * sample_rate)] for s, e in vad_segs]
-        stripped = np.concatenate(chunks)
-        peak = np.abs(stripped).max()
-        if peak > 0:
-            stripped = stripped / peak * 0.95
-        seg_map = _build_segment_map(vad_segs)
+        speech_wav = snapshot.day_dir / f".pascribe-speech-{os.getpid()}.wav"
+        set_activity("Preparing speech audio…", 0.2, source="daily")
+        write_wav_segments(
+            speech_wav,
+            reader,
+            vad_segs,
+            sample_rate,
+            cancel_event=cancel_event,
+            progress=lambda value, message: _progress_activity(0.2 + value * 0.25, message),
+        )
+        seg_map = build_segment_map(vad_segs)
 
-        # Transcribe via AssemblyAI (or fall back to local GPU)
+        if cancel_event.is_set():
+            raise ProcessingCancelled("Daily transcription cancelled")
+
         api_key = config.get("assemblyai_key", "")
         if api_key:
             notify(f"Transcribing {total_speech_s / 60:.0f} min via AssemblyAI...")
-            raw_segs = transcribe_with_assemblyai(stripped, sample_rate)
+            set_activity("Uploading speech audio…", 0.45, source="daily")
+            raw_segs = transcribe_with_assemblyai(
+                speech_wav,
+                sample_rate,
+                cancel_event,
+                progress=lambda value, message: _progress_activity(
+                    None if value is None else 0.45 + value * 0.3,
+                    message,
+                ),
+            )
         else:
             notify(f"No API key — using local GPU ({total_speech_s / 60:.0f} min)...")
-            local = transcribe_audio(stripped)
+            set_activity("Running local Whisper transcription…", 0.5, source="daily")
+            local = transcribe_audio(speech_wav, cancel_event)
             raw_segs = [{"start_s": s, "end_s": e, "text": t} for s, e, t in local]
 
+        if cancel_event.is_set():
+            raise ProcessingCancelled("Daily transcription cancelled")
         if not raw_segs:
             notify("No speech transcribed")
-            update_tray_icon("green")
             return
 
         # Remap timestamps from stripped audio back to original audio time
         for seg in raw_segs:
-            seg["start_s"] = _remap_to_original(seg["start_s"], seg_map)
-            seg["end_s"]   = _remap_to_original(seg["end_s"],   seg_map)
+            seg["start_s"] = remap_to_original(
+                seg["start_s"],
+                seg_map,
+                prefer_next_at_boundary=True,
+            )
+            seg["end_s"] = remap_to_original(seg["end_s"], seg_map)
 
-        # Assign speaker labels using per-segment energy comparison
-        for seg in raw_segs:
-            if has_both:
-                seg["speaker"] = _assign_speaker(
-                    seg["start_s"], seg["end_s"], mic_audio, sys_audio, sample_rate
+        set_activity("Assigning speakers…", 0.82, source="daily")
+        for index, seg in enumerate(raw_segs):
+            if cancel_event.is_set():
+                raise ProcessingCancelled("Daily transcription cancelled")
+            if snapshot.has_both:
+                seg["speaker"] = assign_speaker(
+                    seg["start_s"],
+                    seg["end_s"],
+                    snapshot.mic,
+                    snapshot.system,
+                    sample_rate,
                 )
             else:
-                seg["speaker"] = "you" if sys_audio is None else "discord"
+                seg["speaker"] = "you" if snapshot.system is None else "discord"
+            if index % 25 == 0:
+                set_activity(
+                    "Assigning speakers…",
+                    0.82 + 0.08 * (index + 1) / len(raw_segs),
+                    source="daily",
+                )
 
-        # Add wall-clock timestamps
         for seg in raw_segs:
-            wall = started + timedelta(seconds=seg["start_s"])
+            wall = snapshot.started + timedelta(seconds=seg["start_s"])
             seg["wall_time"] = wall.strftime("%H:%M:%S")
 
         word_count = sum(len(s["text"].split()) for s in raw_segs)
         log.info(f"Daily transcript: {word_count} words, {len(raw_segs)} segments")
 
         payload = {
-            "date": date.today().isoformat(),
-            "recorded_from": started.isoformat(),
+            "date": today,
+            "recorded_from": snapshot.started.isoformat(),
             "duration_minutes": round(duration_s / 60, 1),
             "speech_minutes": round(total_speech_s / 60, 1),
             "word_count": word_count,
@@ -908,12 +987,10 @@ def _daily_transcription_worker():
             ],
         }
 
-        # Save local copy alongside the raw audio
-        rec_path = Path(config.get("recording_path", "recordings"))
-        day_dir = rec_path / date.today().isoformat()
+        set_activity("Saving transcript…", 0.92, source="daily")
+        day_dir = snapshot.day_dir
         out_path = day_dir / "transcript.json"
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+        atomic_write_json(out_path, payload)
         log.info(f"Transcript saved: {out_path}")
 
         # POST to homelab if configured
@@ -926,62 +1003,99 @@ def _daily_transcription_worker():
                 log.error(f"Homelab POST failed: {e}")
                 notify(f"Homelab error: {e}")
 
-        # Optionally delete raw audio after successful transcription
         if config.get("delete_after_transcribe"):
-            for name in ("mic.raw", "sys.raw"):
-                p = day_dir / name
-                if p.exists():
-                    p.unlink()
-            log.info("Raw audio deleted after transcription")
+            if daily_recorder is not None:
+                log.info("Preserved active raw audio; it cannot be safely deleted while recording")
+            else:
+                snapshot.close()
+                snapshot = None
+                for name in ("mic.raw", "sys.raw"):
+                    path = day_dir / name
+                    if path.exists():
+                        path.unlink()
+                log.info("Raw audio deleted after transcription")
 
+        set_activity("Complete", 1.0, source="daily")
         notify(f"Done — {word_count} words, {total_speech_s / 60:.0f} min of speech")
-        update_tray_icon("green")
 
+    except ProcessingCancelled:
+        log.info("Daily transcription cancelled")
+        notify("Daily transcription cancelled")
     except Exception as e:
         log.error(f"Daily transcription failed: {e}", exc_info=True)
         notify(f"Daily transcription failed: {e}")
-        update_tray_icon("red")
-        threading.Timer(3, lambda: update_tray_icon("green")).start()
+        show_tray_error()
+    finally:
+        if snapshot is not None:
+            snapshot.close()
+        if speech_wav is not None:
+            try:
+                speech_wav.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                log.warning(f"Could not remove temporary speech WAV: {error}")
+        clear_activity("daily")
+        refresh_tray_icon()
 
 # ─── Hotkey Handling ──────────────────────────────────────────────────────────
 
 def on_transcribe(minutes: int):
-    """Handle hotkey press: cancel previous, grab audio, transcribe, clipboard."""
-    global last_transcript, _current_cancel, _transcribing
-
+    """Queue a quick transcription; the latest request replaces older pending work."""
     if _paused:
         return
+    runner = _get_quick_jobs()
+    submission = runner.submit(minutes)
+    if not submission.started_immediately:
+        message = f"Queued latest request: last {minutes} min"
+        set_activity(message, source="quick")
+        notify(message)
+        log.info(message)
 
-    # Prevent overlapping transcriptions — only one at a time
-    with _transcribing_lock:
-        if _transcribing:
-            log.info("Transcription already in progress, cancelling previous")
-        _transcribing = True
 
+def cancel_quick_transcription():
+    runner = _quick_jobs
+    if runner is not None and runner.cancel():
+        set_activity("Cancelling quick transcription…", source="quick")
+        notify("Cancelling quick transcription…")
+        return True
+    return False
+
+
+def _get_quick_jobs():
+    global _quick_jobs
+    if _quick_jobs is None:
+        with _quick_jobs_init_lock:
+            if _quick_jobs is None:
+                _quick_jobs = LatestJobRunner(
+                    _on_transcribe_inner,
+                    name="pascribe-quick-transcription",
+                    on_error=lambda error: log.error(
+                        f"Unhandled transcription worker error: {error}", exc_info=True
+                    ),
+                )
+    return _quick_jobs
+
+
+def _on_transcribe_inner(minutes: int, cancel: threading.Event):
     try:
-        _on_transcribe_inner(minutes)
-    except Exception as e:
-        log.error(f"Unhandled transcription thread error: {e}")
-        try:
-            update_tray_icon("red")
-            threading.Timer(3, lambda: update_tray_icon("green")).start()
-        except Exception:
-            pass
+        _run_quick_transcription(minutes, cancel)
+    except Exception as error:
+        if not cancel.is_set():
+            log.error(f"Transcription error: {error}", exc_info=True)
+            show_tray_error()
+            notify(f"Error: {error}")
     finally:
-        with _transcribing_lock:
-            _transcribing = False
+        clear_activity("quick")
+        refresh_tray_icon()
 
-def _on_transcribe_inner(minutes: int):
-    global last_transcript, _current_cancel
 
-    # Cancel any in-progress transcription and create a fresh event
-    with _cancel_lock:
-        _current_cancel.set()
-        cancel = threading.Event()
-        _current_cancel = cancel
+def _run_quick_transcription(minutes: int, cancel: threading.Event):
+    global last_transcript
 
     log.info(f"Transcribing last {minutes} minute(s)...")
-    update_tray_icon("yellow")
+    set_activity(f"Transcribing last {minutes} min…", source="quick")
+    refresh_tray_icon()
     notify(f"Transcribing last {minutes} min...")
 
     # Get audio from buffers and resample to 16 kHz for Whisper
@@ -989,17 +1103,16 @@ def _on_transcribe_inner(minutes: int):
 
     mic_audio = mic_buffer.get_last_n_minutes(minutes)
     if mic_audio is not None and mic_buffer.capture_rate != whisper_rate:
-        mic_audio = _resample(mic_audio, mic_buffer.capture_rate, whisper_rate)
+        mic_audio = resample_audio(mic_audio, mic_buffer.capture_rate, whisper_rate)
 
     loopback_audio = loopback_buffer.get_last_n_minutes(minutes)
     if loopback_audio is not None and loopback_buffer.capture_rate != whisper_rate:
-        loopback_audio = _resample(loopback_audio, loopback_buffer.capture_rate, whisper_rate)
+        loopback_audio = resample_audio(loopback_audio, loopback_buffer.capture_rate, whisper_rate)
 
     if mic_audio is None and loopback_audio is None:
         log.warning("No audio in buffer")
-        update_tray_icon("red")
+        show_tray_error()
         notify("No audio in buffer")
-        threading.Timer(3, lambda: update_tray_icon("green")).start()
         return
 
     # Mix streams
@@ -1027,30 +1140,22 @@ def _on_transcribe_inner(minutes: int):
             return
 
         if segments:
-            transcript = format_ssmd(segments)
+            transcript = format_transcript(segments)
             pyperclip.copy(transcript)
-            last_transcript = transcript[:200]
+            last_transcript = transcript
             word_count = sum(len(t.split()) for _, _, t in segments)
             log.info(f"{word_count} words in {elapsed:.1f}s -> clipboard")
-            update_tray_icon("green")
             notify(f"{word_count} words in {elapsed:.1f}s")
             add_history_entry(minutes, word_count, elapsed, transcript)
         else:
             log.info("No speech detected")
-            update_tray_icon("green")
             notify("No speech detected")
     except Exception as e:
         if cancel.is_set():
             return
         log.error(f"Transcription error: {e}")
-        update_tray_icon("red")
+        show_tray_error()
         notify(f"Error: {e}")
-        threading.Timer(3, lambda: update_tray_icon("green")).start()
-    finally:
-        try:
-            unload_whisper()
-        except Exception as e:
-            log.error(f"Error unloading Whisper: {e}")
 
 def register_hotkeys():
     """Register hotkeys from config."""
@@ -1062,9 +1167,7 @@ def register_hotkeys():
         minutes = hotkeys[key]
         keyboard.add_hotkey(
             f"{prefix}+{key}",
-            lambda m=minutes: threading.Thread(
-                target=on_transcribe, args=(m,), daemon=True
-            ).start(),
+            lambda m=minutes: on_transcribe(m),
             suppress=True,
         )
         log.info(f"  {prefix} + {key} -> {minutes} min")
@@ -1101,6 +1204,25 @@ def update_tray_icon(color: str):
     if tray_icon:
         tray_icon.icon = create_tray_image(color)
 
+
+def refresh_tray_icon() -> None:
+    """Derive the steady tray color from error, pause, and active job state."""
+    if time.monotonic() < _tray_error_until:
+        update_tray_icon("red")
+    elif _paused:
+        update_tray_icon("gray")
+    else:
+        with _activity_lock:
+            busy = bool(_activity_states)
+        update_tray_icon("yellow" if busy else "green")
+
+
+def show_tray_error(seconds: float = 3.0) -> None:
+    global _tray_error_until
+    _tray_error_until = max(_tray_error_until, time.monotonic() + seconds)
+    update_tray_icon("red")
+    threading.Timer(seconds, refresh_tray_icon).start()
+
 def notify(message: str):
     """Show a balloon notification and update the tray tooltip."""
     if tray_icon:
@@ -1127,6 +1249,19 @@ def _build_dashboard_tab(frame, root):
     status_txt.grid(row=0, column=1, sticky="w")
     info_txt = ttk.Label(status_lf, text="", foreground="#6b7280", font=("Segoe UI", 9))
     info_txt.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    meters = ttk.Frame(status_lf)
+    meters.grid(row=0, column=2, rowspan=2, sticky="e", padx=(24, 0))
+    ttk.Label(meters, text="Mic", width=7).grid(row=0, column=0, sticky="w")
+    mic_meter = ttk.Progressbar(meters, maximum=100, length=150, mode="determinate")
+    mic_meter.grid(row=0, column=1, padx=(4, 0))
+    ttk.Label(meters, text="System", width=7).grid(row=1, column=0, sticky="w")
+    system_meter = ttk.Progressbar(meters, maximum=100, length=150, mode="determinate")
+    system_meter.grid(row=1, column=1, padx=(4, 0))
+    status_lf.columnconfigure(2, weight=1)
+
+    progress = ttk.Progressbar(status_lf, maximum=100, mode="determinate")
+    progress.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+    progress.grid_remove()
 
     # ── Quick Transcribe ──────────────────────────────────────────────────────
     qt_lf = ttk.LabelFrame(frame, text="Quick Transcribe", padding=10)
@@ -1140,9 +1275,7 @@ def _build_dashboard_tab(frame, root):
     btn_row.pack(anchor="w")
     for m in sorted(set(config.get("hotkeys", {}).values())):
         def _make_cmd(mins=m):
-            def _cmd():
-                threading.Thread(target=on_transcribe, args=(mins,), daemon=True).start()
-            return _cmd
+            return lambda: on_transcribe(mins)
         ttk.Button(btn_row, text=f"{m} min", width=7, command=_make_cmd()).pack(
             side=tk.LEFT, padx=2, pady=1
         )
@@ -1163,8 +1296,16 @@ def _build_dashboard_tab(frame, root):
     ttk.Button(
         act_row,
         text="🎙 Transcribe Today",
-        command=lambda: threading.Thread(target=run_daily_transcription, daemon=True).start(),
+        command=run_daily_transcription,
     ).pack(side=tk.LEFT, padx=(0, 6))
+    def _cancel_active():
+        cancelled = cancel_quick_transcription()
+        cancelled = cancel_daily_transcription() or cancelled
+        if not cancelled:
+            notify("No active transcription to cancel")
+    ttk.Button(act_row, text="Cancel Active", command=_cancel_active).pack(
+        side=tk.LEFT, padx=(0, 6)
+    )
     startup_var = tk.BooleanVar(value=is_startup_enabled())
     def _toggle_startup():
         set_startup(startup_var.get())
@@ -1201,16 +1342,25 @@ def _build_dashboard_tab(frame, root):
                 return
         except Exception:
             return
+        activity, activity_progress = get_activity()
+        quick_active = _quick_jobs is not None and _quick_jobs.is_active
         if _paused:
             dot.config(fg="#6b7280")
             status_txt.config(text="Paused")
-        elif _transcribing:
+        elif quick_active or _daily_jobs.is_active:
             dot.config(fg="#eab308")
-            status_txt.config(text="Transcribing…")
+            status_txt.config(text=activity)
         else:
             dot.config(fg="#22c55e")
             status_txt.config(text="Recording daily" if config.get("daily_recording") else "Ready")
-        rec_path = Path(config.get("recording_path", "recordings"))
+        if activity_progress is None:
+            progress.grid_remove()
+        else:
+            progress["value"] = max(0, min(100, activity_progress * 100))
+            progress.grid()
+        mic_meter["value"] = _mic_level * 100
+        system_meter["value"] = _system_level * 100
+        rec_path = get_recording_path()
         mic_f = rec_path / date.today().isoformat() / "mic.raw"
         info_txt.config(
             text=f"Today's recording: {mic_f.stat().st_size / 1024 / 1024:.1f} MB"
@@ -1218,9 +1368,12 @@ def _build_dashboard_tab(frame, root):
         )
         lt_txt.configure(state=tk.NORMAL)
         lt_txt.delete("1.0", tk.END)
+        preview = last_transcript
+        if len(preview) > 4000:
+            preview = preview[:4000] + "\n\n… Open History to view the complete transcript."
         lt_txt.insert(
             tk.END,
-            last_transcript or "(No transcription yet — use a hotkey or click a button above)",
+            preview or "(No transcription yet — use a hotkey or click a button above)",
         )
         lt_txt.configure(state=tk.DISABLED)
         root.after(1000, _refresh)
@@ -1500,7 +1653,7 @@ def _build_transcripts_tab(frame, root):
         if not sel:
             return
         chosen   = date_lb.get(sel[0])
-        rec_path = Path(config.get("recording_path", "recordings"))
+        rec_path = get_recording_path()
         tf       = rec_path / chosen / "transcript.json"
         if not tf.exists():
             txt.configure(state=tk.NORMAL)
@@ -1530,7 +1683,7 @@ def _build_transcripts_tab(frame, root):
     filter_var.trace_add("write", _on_filter_change)
     date_lb.bind("<<ListboxSelect>>", _load_date)
 
-    rec_path = Path(config.get("recording_path", "recordings"))
+    rec_path = get_recording_path()
     if rec_path.exists():
         dates = sorted([d.name for d in rec_path.iterdir() if d.is_dir()], reverse=True)
         for d in dates:
@@ -1609,12 +1762,56 @@ def _build_settings_tab(frame, root):
     ttk.Combobox(r, textvariable=sys_var, values=device_labels,
                  state="readonly", width=55).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+    device_test_var = tk.StringVar(value="")
+    device_test_row = ttk.Frame(inner)
+    device_test_row.pack(fill=tk.X, padx=14, pady=(0, 4))
+    ttk.Label(device_test_row, textvariable=device_test_var, foreground="#6b7280").pack(
+        side=tk.LEFT
+    )
+
+    def _test_selected_devices():
+        try:
+            selected = []
+            for label, value in (("Mic", mic_var.get()), ("System", sys_var.get())):
+                index = device_labels.index(value)
+                device_id = device_ids[index]
+                if device_id is not None:
+                    selected.append((label, device_id))
+        except ValueError:
+            device_test_var.set("Select valid devices first.")
+            return
+        if not selected:
+            device_test_var.set("No devices selected.")
+            return
+        device_test_var.set("Testing selected devices…")
+        test_button.state(["disabled"])
+
+        def worker():
+            messages = []
+            for label, device_id in selected:
+                try:
+                    level, sample_rate = measure_input_device(device_id)
+                    messages.append(f"{label}: {level * 100:.0f}% level at {sample_rate} Hz")
+                except Exception as error:
+                    messages.append(f"{label}: failed — {error}")
+            root.after(0, lambda: device_test_var.set("  |  ".join(messages)))
+            root.after(0, lambda: test_button.state(["!disabled"]))
+
+        threading.Thread(target=worker, name="pascribe-device-test", daemon=True).start()
+
+    test_button = ttk.Button(
+        device_test_row,
+        text="Test selected devices",
+        command=_test_selected_devices,
+    )
+    test_button.pack(side=tk.RIGHT)
+
     def _hint(text: str):
         ttk.Label(inner, text=text, foreground="#9ca3af", font=("Segoe UI", 8)).pack(
             anchor="w", padx=14, pady=(0, 6)
         )
 
-    _hint("Device changes require a restart to take effect.")
+    _hint("Test devices now; changing active capture devices still requires a restart.")
 
     _section("Transcription")
 
@@ -1654,7 +1851,7 @@ def _build_settings_tab(frame, root):
     ).pack(anchor="w", padx=14, pady=(0, 4))
     _hint("Stores ~32 KB/s per stream (int16 PCM). Two streams = ~1.75 GB per 8-hour day.")
 
-    path_var = tk.StringVar(value=config.get("recording_path", "recordings"))
+    path_var = tk.StringVar(value=str(get_recording_path()))
     r = _field_row("Recording Path:")
     ttk.Entry(r, textvariable=path_var, width=30).pack(side=tk.LEFT, fill=tk.X, expand=True)
     def _browse_path():
@@ -1674,7 +1871,7 @@ def _build_settings_tab(frame, root):
         r, text="Show", variable=show_var,
         command=lambda: key_entry.config(show="" if show_var.get() else "*"),
     ).pack(side=tk.LEFT, padx=(6, 0))
-    _hint("Required for daily transcription. ~$0.0035/min billed after VAD silence stripping.")
+    _hint("Required for cloud transcription. Protected with Windows DPAPI when saved.")
 
     url_var = tk.StringVar(value=config.get("homelab_url") or "")
     r = _field_row("Homelab URL:")
@@ -1685,7 +1882,7 @@ def _build_settings_tab(frame, root):
     ttk.Checkbutton(
         inner, text="Delete raw audio after successful transcription", variable=del_var
     ).pack(anchor="w", padx=14, pady=(0, 4))
-    _hint("Frees disk space. Transcription must succeed first — raw files are never deleted on error.")
+    _hint("Raw audio is deleted only when it is not actively being recorded and transcription succeeded.")
 
     ttk.Separator(inner, orient="horizontal").pack(fill=tk.X, padx=14, pady=(8, 6))
     status_var = tk.StringVar(value="")
@@ -1694,28 +1891,145 @@ def _build_settings_tab(frame, root):
     btn_r.pack(anchor="e", padx=14, pady=(4, 14))
 
     def _save():
-        mic_i = device_labels.index(mic_var.get())
-        sys_i = device_labels.index(sys_var.get())
-        config.update({
+        try:
+            mic_i = device_labels.index(mic_var.get())
+            sys_i = device_labels.index(sys_var.get())
+            buffer_minutes = int(buf_var.get())
+        except (ValueError, tk.TclError):
+            status_var.set("Select valid devices and enter a numeric buffer duration.")
+            return
+
+        updates = {
             "mic_device":              device_ids[mic_i],
             "mic_device_name":         device_names[mic_i],
             "system_device":           device_ids[sys_i],
             "system_device_name":      device_names[sys_i],
             "whisper_model":           model_var.get(),
             "whisper_device":          wdev_var.get(),
-            "buffer_minutes":          buf_var.get(),
+            "buffer_minutes":          buffer_minutes,
             "hotkey_prefix":           prefix_var.get().strip(),
             "daily_recording":         daily_var.get(),
-            "recording_path":          path_var.get().strip() or "recordings",
+            "recording_path":          path_var.get().strip(),
             "assemblyai_key":          key_var.get().strip(),
             "homelab_url":             url_var.get().strip() or None,
             "delete_after_transcribe": del_var.get(),
-        })
+        }
+        errors = validate_settings(updates)
+        if errors:
+            status_var.set(errors[0])
+            return
+
+        global daily_recorder
+        old_recording_path = get_recording_path()
+        old_daily_recording = config.get("daily_recording", False)
+        config.update(updates)
         save_config(config)
-        status_var.set("Saved! Restart Pascribe for device and hotkey changes to take effect.")
+        mic_buffer.resize(buffer_minutes * 60 // CHUNK_SECONDS)
+        loopback_buffer.resize(buffer_minutes * 60 // CHUNK_SECONDS)
+
+        new_recording_path = get_recording_path()
+        if old_daily_recording != daily_var.get() or old_recording_path != new_recording_path:
+            if daily_recorder is not None:
+                daily_recorder.close()
+                daily_recorder = None
+            if daily_var.get():
+                daily_recorder = DailyAudioRecorder(str(new_recording_path))
+
+        status_var.set(
+            "Saved. Recording, storage, model, and buffer settings are active; "
+            "restart for device/hotkey changes."
+        )
         log.info("Settings saved via panel")
 
     ttk.Button(btn_r, text="Save Settings", command=_save).pack(side=tk.RIGHT)
+
+
+def _build_diagnostics_tab(frame, root):
+    """Diagnostics: copyable checks for installation, audio, storage, and CUDA."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    header = ttk.Frame(frame)
+    header.pack(fill=tk.X, padx=14, pady=(14, 8))
+    ttk.Label(
+        header,
+        text="Desktop Diagnostics",
+        font=("Segoe UI", 11, "bold"),
+    ).pack(side=tk.LEFT)
+    status = ttk.Label(header, text="", foreground="#6b7280")
+    status.pack(side=tk.LEFT, padx=(12, 0))
+
+    text_frame = ttk.Frame(frame)
+    text_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 8))
+    output = tk.Text(
+        text_frame,
+        wrap=tk.WORD,
+        font=("Consolas", 9),
+        relief=tk.FLAT,
+        padx=8,
+        pady=8,
+        state=tk.DISABLED,
+    )
+    scrollbar = ttk.Scrollbar(text_frame, command=output.yview)
+    output.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    output.pack(fill=tk.BOTH, expand=True)
+    output.tag_configure("PASS", foreground="#059669")
+    output.tag_configure("WARN", foreground="#b45309")
+    output.tag_configure("FAIL", foreground="#dc2626")
+    current_text = {"value": ""}
+
+    def refresh():
+        status.config(text="Running checks…")
+        try:
+            results = collect_diagnostics(
+                data_dir=APP_PATHS.data_dir,
+                recording_dir=get_recording_path(),
+                whisper_device=config.get("whisper_device", "cuda"),
+                input_devices=list_input_devices(),
+            )
+            report = format_diagnostics(results)
+            report += (
+                f"\n\nData directory: {APP_PATHS.data_dir}"
+                f"\nConfig file: {CONFIG_PATH}"
+                f"\nLog file: {LOG_PATH}"
+            )
+            current_text["value"] = report
+            output.configure(state=tk.NORMAL)
+            output.delete("1.0", tk.END)
+            for line in report.splitlines(keepends=True):
+                tag = line[1:5].rstrip("]") if line.startswith("[") else ""
+                output.insert(tk.END, line, tag if tag in {"PASS", "WARN", "FAIL"} else None)
+            output.configure(state=tk.DISABLED)
+            failures = sum(1 for item in results if item.status == "FAIL")
+            status.config(
+                text=(
+                    "All essential checks passed"
+                    if not failures
+                    else f"{failures} check(s) need attention"
+                )
+            )
+        except Exception as error:
+            status.config(text=f"Diagnostics failed: {error}")
+
+    def copy_report():
+        if current_text["value"]:
+            pyperclip.copy(current_text["value"])
+            status.config(text="Copied diagnostics")
+
+    def open_data_folder():
+        APP_PATHS.data_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(APP_PATHS.data_dir)  # type: ignore[attr-defined]
+        except Exception as error:
+            status.config(text=f"Could not open data folder: {error}")
+
+    buttons = ttk.Frame(frame)
+    buttons.pack(fill=tk.X, padx=14, pady=(0, 14))
+    ttk.Button(buttons, text="Refresh", command=refresh).pack(side=tk.LEFT)
+    ttk.Button(buttons, text="Open Data Folder", command=open_data_folder).pack(side=tk.LEFT, padx=(6, 0))
+    ttk.Button(buttons, text="Copy Report", command=copy_report).pack(side=tk.RIGHT)
+    refresh()
 
 
 # ─── Main Control Panel ───────────────────────────────────────────────────────
@@ -1772,7 +2086,7 @@ def open_main_panel(start_tab: int = 0):
             ttk.Separator(footer, orient="horizontal").pack(fill=tk.X)
             footer_inner = ttk.Frame(footer)
             footer_inner.pack(fill=tk.X, padx=10, pady=3)
-            _ver_lbl = ttk.Label(footer_inner, text="Pascribe v0.5",
+            _ver_lbl = ttk.Label(footer_inner, text=f"Pascribe v{__version__}",
                                  foreground="#9ca3af", font=("Segoe UI", 8))
             _ver_lbl.pack(side=tk.LEFT)
             _footer_status = ttk.Label(footer_inner, text="", foreground="#6b7280",
@@ -1787,10 +2101,11 @@ def open_main_panel(start_tab: int = 0):
                     return
                 if _paused:
                     _footer_status.config(text="Hotkeys paused")
-                elif _transcribing:
-                    _footer_status.config(text="Transcribing…")
+                elif (_quick_jobs is not None and _quick_jobs.is_active) or _daily_jobs.is_active:
+                    activity, _progress = get_activity()
+                    _footer_status.config(text=activity)
                 elif config.get("daily_recording"):
-                    rec_path = Path(config.get("recording_path", "recordings"))
+                    rec_path = get_recording_path()
                     mic_f = rec_path / date.today().isoformat() / "mic.raw"
                     mb = mic_f.stat().st_size / 1024 / 1024 if mic_f.exists() else 0
                     _footer_status.config(text=f"Recording — {mb:.0f} MB today")
@@ -1809,12 +2124,13 @@ def open_main_panel(start_tab: int = 0):
                 ("  History  ",           _build_history_tab),
                 ("  Daily Transcripts  ", _build_transcripts_tab),
                 ("  Settings  ",          _build_settings_tab),
+                ("  Diagnostics  ",       _build_diagnostics_tab),
             ]:
                 f = ttk.Frame(nb)
                 nb.add(f, text=title)
                 builder(f, root)
 
-            nb.select(min(start_tab, 3))
+            nb.select(min(start_tab, 4))
             root.protocol("WM_DELETE_WINDOW", root.destroy)
             root.mainloop()
         finally:
@@ -1839,6 +2155,11 @@ def open_daily_transcripts():
     """Open the control panel at the Daily Transcripts tab."""
     open_main_panel(start_tab=2)
 
+
+def open_diagnostics():
+    """Open the control panel at the Diagnostics tab."""
+    open_main_panel(start_tab=4)
+
 # ─── Windows Startup Toggle ──────────────────────────────────────────────────
 
 STARTUP_DIR = (
@@ -1858,29 +2179,41 @@ def is_startup_enabled() -> bool:
 def set_startup(enabled: bool):
     """Create or remove the Windows startup shortcut."""
     if enabled:
+        STARTUP_DIR.mkdir(parents=True, exist_ok=True)
+        frozen = getattr(sys, "frozen", False)
         target = str(
-            (Path(__file__).parent / "venv" / "Scripts" / "pythonw.exe").resolve()
+            Path(sys.executable).resolve()
+            if frozen
+            else (APP_DIR / "venv" / "Scripts" / "pythonw.exe").resolve()
         )
-        script = str(Path(__file__).resolve())
-        working_dir = str(Path(__file__).parent.resolve())
+        script = "" if frozen else str(Path(__file__).resolve())
+        working_dir = str(APP_DIR)
         lnk_path = str(STARTUP_LNK)
 
+        def ps_quote(value: str) -> str:
+            return value.replace("'", "''")
+
         # Create .lnk shortcut via PowerShell WScript.Shell COM object
+        arguments = "" if frozen else f'"{ps_quote(script)}"'
         ps_cmd = (
             f"$ws = New-Object -ComObject WScript.Shell; "
-            f"$s = $ws.CreateShortcut('{lnk_path}'); "
-            f"$s.TargetPath = '{target}'; "
-            f"$s.Arguments = '\"{script}\"'; "
-            f"$s.WorkingDirectory = '{working_dir}'; "
+            f"$s = $ws.CreateShortcut('{ps_quote(lnk_path)}'); "
+            f"$s.TargetPath = '{ps_quote(target)}'; "
+            f"$s.Arguments = '{arguments}'; "
+            f"$s.WorkingDirectory = '{ps_quote(working_dir)}'; "
             f"$s.Save()"
         )
 
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_cmd],
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 capture_output=True,
+                text=True,
+                timeout=30,
             )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "PowerShell returned an error")
             log.info("Startup shortcut created")
         except Exception as e:
             log.error(f"Failed to create startup shortcut: {e}")
@@ -1902,13 +2235,19 @@ def on_pause_toggle(icon, item):
         notify("Paused — hotkeys disabled")
         log.info("Hotkeys paused by user")
     else:
-        update_tray_icon("green")
+        refresh_tray_icon()
         notify("Resumed — hotkeys active")
         log.info("Hotkeys resumed by user")
 
 # ─── Tray Setup ──────────────────────────────────────────────────────────────
 
 def on_quit(icon, item):
+    cancel_quick_transcription()
+    cancel_daily_transcription()
+    try:
+        keyboard.unhook_all_hotkeys()
+    except Exception:
+        pass
     if daily_recorder:
         daily_recorder.close()
     icon.stop()
@@ -1943,12 +2282,13 @@ def setup_tray():
     menu = Menu(
         MenuItem("Open Panel…", lambda icon, item: open_main_panel(), default=True),
         Menu.SEPARATOR,
-        MenuItem("Pascribe v0.5", lambda: None, enabled=False),
+        MenuItem(f"Pascribe v{__version__}", lambda: None, enabled=False),
         MenuItem(daily_label, lambda: None, enabled=False),
         Menu.SEPARATOR,
         MenuItem("Settings…",              lambda icon, item: open_settings()),
         MenuItem("Transcription History…", lambda icon, item: open_history()),
         MenuItem("Daily Transcripts…",     lambda icon, item: open_daily_transcripts()),
+        MenuItem("Diagnostics…",           lambda icon, item: open_diagnostics()),
         Menu.SEPARATOR,
         MenuItem("Transcribe today…",      lambda icon, item: run_daily_transcription()),
         MenuItem("Pause hotkeys",          on_pause_toggle, checked=lambda item: _paused),
@@ -1986,7 +2326,7 @@ def main():
         log.warning("Pascribe is already running — exiting duplicate")
         sys.exit(0)
 
-    log.info("Pascribe v0.5 starting")
+    log.info(f"Pascribe v{__version__} starting")
 
     # Start audio capture — app continues even if no streams start
     streams = start_audio_streams()

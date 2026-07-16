@@ -94,8 +94,16 @@ Captures mic and system audio into a rolling RAM buffer. Press a hotkey to trans
 ```bash
 git clone https://github.com/NiklavsD/pascribe.git
 cd pascribe
-install.bat
+
+# NVIDIA GPU (default)
+install.bat gpu
+
+# Or a smaller CPU-only installation
+install.bat cpu
 ```
+
+The installer checks for Python 3.11+, creates an isolated virtual environment,
+installs pinned desktop dependencies, and verifies that they import correctly.
 
 ### Usage
 
@@ -109,10 +117,11 @@ On first launch, Pascribe starts in the system tray. **Left-click** the icon to 
 
 | Tab | Contents |
 |-----|----------|
-| **Dashboard** | Live status, quick-transcribe buttons, Pause/Resume, last transcript preview |
+| **Dashboard** | Live mic/system levels, job progress, quick-transcribe buttons, cancellation, last transcript |
 | **History** | Past quick-transcriptions — click to copy |
 | **Daily Transcripts** | Browse speaker-labeled transcripts by date; search, filter, copy |
-| **Settings** | Devices, Whisper model, hotkeys, API key, homelab URL |
+| **Settings** | Devices and device test, Whisper model, hotkeys, protected API key, homelab URL |
+| **Diagnostics** | Copyable checks for Python, dependencies, devices, storage, and CUDA |
 
 ### Hotkeys (Ctrl+Alt + number)
 
@@ -127,12 +136,13 @@ On first launch, Pascribe starts in the system tray. **Left-click** the icon to 
 Enable **daily recording** in Settings. At end of day, click **Transcribe Today**:
 
 1. Strips silence with VAD to reduce billable audio
-2. Uploads to AssemblyAI for transcription
+2. Streams the speech-only WAV to AssemblyAI without loading the full day into RAM
 3. Assigns speaker labels ("you" vs "discord")
 4. Saves transcript with timestamps
 5. Optionally POSTs to your AI agent's webhook
 
-**Cost:** ~$12/month for 8h/day recording after VAD reduces to ~2–3h billable.
+Daily processing is disk-backed and cancellable. Only one daily job can run at a
+time, and active recording files are never deleted while they are still open.
 
 ### OpenClaw Integration
 
@@ -155,7 +165,10 @@ If you use Voicemeeter to separate Discord audio from your mic, set each device 
 
 ### Config
 
-All options editable in the Settings panel. Key fields:
+All options are editable in the Settings panel. Runtime data is stored under
+`%LOCALAPPDATA%\Pascribe`; existing root-level configuration and history are
+migrated automatically, with the old config retained as `config.json.migrated.bak`.
+The AssemblyAI key is protected with Windows DPAPI.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -163,15 +176,32 @@ All options editable in the Settings panel. Key fields:
 | `whisper_device` | `cuda` | `cuda` or `cpu` |
 | `buffer_minutes` | `60` | Rolling RAM buffer |
 | `daily_recording` | `false` | Enable disk recording |
-| `assemblyai_key` | `""` | AssemblyAI API key |
+| `assemblyai_key` | `""` | AssemblyAI API key (DPAPI-protected on disk) |
 | `homelab_url` | `null` | Webhook for transcripts |
 
 ### Safety
 
 - **VRAM check** — won't load Whisper if insufficient GPU memory
+- **Serialized inference** — only one Whisper lifecycle can own the model and VRAM
+- **Latest-request queue** — repeated hotkeys keep only the newest pending request
+- **Chunked daily processing** — full-day raw streams stay disk-backed
+- **Atomic storage** — configuration, history, and transcripts survive interrupted writes
 - **Hallucination filter** — discards known phantom Whisper outputs
 - **Single-instance lock** — prevents duplicate tray instances
 - **Pause hotkeys** — toggle via Dashboard or tray menu
+
+### Desktop Development
+
+```bash
+# Run the hardware-independent core tests
+test.bat
+
+# Build a Windows onedir application
+powershell -ExecutionPolicy Bypass -File build.ps1 -Mode cpu
+```
+
+Windows builds must be produced on Windows. `build.ps1 -Mode gpu` also includes
+the pinned CUDA 12/cuDNN 9 runtime packages.
 
 **Requirements:** Windows 10/11 • Python 3.11+ • NVIDIA GPU with CUDA (recommended) • ~3.5 GB VRAM for large-v3
 

@@ -11,8 +11,9 @@ Pascribe is a Windows-only system tray application that:
 ## Setup & Run
 
 ```bash
-# Install (creates venv, installs deps + CUDA libraries)
-install.bat
+# Install GPU or CPU mode
+install.bat gpu
+install.bat cpu
 
 # Run
 run.bat
@@ -21,38 +22,51 @@ run.bat
 venv/Scripts/python pascribe.py
 ```
 
-No test suite exists. The app requires audio hardware to run.
+Core tests do not require audio hardware or a GPU:
+
+```bash
+test.bat
+# or: venv/Scripts/python -m unittest discover -s tests -v
+```
 
 ## Architecture
 
-The entire application is a single file: `pascribe.py` (~1500 lines).
+`pascribe.py` remains the Windows entry point and UI shell. Testable services are
+split into `pascribe_app/` modules:
+
+- `audio_processing.py` — streaming VAD, resampling, timestamp maps, bounded WAV writing
+- `recordings.py` — fixed-size, disk-backed raw-audio snapshots and speaker comparison
+- `jobs.py` — latest-request and exclusive cancellable background-job runners
+- `storage.py` — atomic JSON writes and corrupt-file recovery
+- `paths.py` — `%LOCALAPPDATA%\Pascribe` paths and legacy-data migration
+- `validation.py` — config normalization and settings validation
+- `secrets.py` — Windows DPAPI protection for the AssemblyAI key
+- `diagnostics.py` — environment, audio, storage, dependency, and CUDA checks
+- `transcription.py` — cloud word-response validation and utterance grouping
 
 **Data flow (quick hotkey):**
-Audio devices → sounddevice callbacks → AudioBuffer deques → mix on hotkey → faster-whisper → pyperclip → clipboard
+Audio devices → sounddevice callbacks → AudioBuffer deques → latest-request queue → serialized faster-whisper lifecycle → clipboard
 
 **Data flow (daily recording):**
-Audio devices → sounddevice callbacks → DailyAudioRecorder → mic.raw / sys.raw on disk → VAD strip → AssemblyAI API → speaker assignment → transcript.json → HTTP POST to homelab
+Audio devices → DailyAudioRecorder → fixed disk snapshot → streaming VAD → speech-only WAV → AssemblyAI/local Whisper → disk-backed speaker assignment → atomic transcript.json → optional webhook
 
 **Key components within pascribe.py:**
 
-- **Config** (~line 64): Loads/saves `config.json`. New keys: `daily_recording`, `recording_path`, `assemblyai_key`, `homelab_url`, `delete_after_transcribe`.
+- **Config**: Stored under `%LOCALAPPDATA%\Pascribe`, validated on load, written atomically, and migrated from legacy root files.
 - **AudioBuffer** (~line 200): Thread-safe deque of 1-second numpy chunks. Two globals: `mic_buffer` and `loopback_buffer`.
 - **Audio Capture** (~line 255): Two `sounddevice.InputStream` callbacks write mono float32 chunks into RAM buffers AND (if enabled) to `DailyAudioRecorder`.
 - **Transcription** (~line 330): Lazy-loads `faster-whisper` `WhisperModel` on first use. Includes VRAM check before loading, hallucination filter on output.
 - **Resampling** (~line 420): Linear interpolation via numpy for devices that don't support 16 kHz natively.
-- **DailyAudioRecorder** (~line 430): Writes float32 raw PCM to `recordings/YYYY-MM-DD/mic.raw` and `sys.raw` at 16 kHz. Creates `meta.json` with session start time. Resumes across restarts by appending.
-- **Energy VAD** (`_energy_vad`, ~line 490): Adaptive energy-based silence detection. Used to pre-strip audio before AssemblyAI upload to reduce billable minutes.
-- **AssemblyAI** (~line 580): `transcribe_with_assemblyai()` — upload WAV bytes, poll for completion, group words into utterances by pause threshold.
-- **Speaker Assignment** (`_assign_speaker`, ~line 560): Compares per-segment RMS energy of mic vs system stream to label each utterance as "you" or "discord" — no diarization needed.
-- **Daily Transcription** (`_daily_transcription_worker`, ~line 625): Orchestrates load → VAD → transcribe → remap timestamps → assign speakers → save JSON → POST to homelab.
-- **Hotkey Handling** (~line 710): `keyboard` library registers `{prefix}+{key}` combos. Each press spawns a daemon thread. Includes pause guard and single-transcription-at-a-time lock.
+- **DailyAudioRecorder**: Writes int16 raw PCM and exposes flushed sample limits for stable snapshots.
+- **Daily Transcription**: Uses bounded reads; it does not construct full mic, system, mixed, or stripped arrays in memory.
+- **Hotkey Handling**: Inference is serialized and only the newest pending request is retained.
 - **Tray Icon** (~line 800): `pystray` icon. Menu: Settings, Transcription History, Daily Transcripts viewer, Transcribe today, Pause hotkeys, Run on startup, Quit.
 - **Settings Window** (~line 840): tkinter GUI for device selection and daily recording toggle.
 - **History Window** (~line 900): Shows quick-transcription history; click to copy.
 - **Daily Transcripts Viewer** (~line 970): Split-pane tkinter window. Left: date list. Right: speaker-colored transcript with search, filter by speaker (you/discord), click-to-copy line, copy buttons.
 - **Single-instance lock** (`_acquire_instance_lock`, ~line 1130): Binds port 47823 locally to prevent duplicate tray instances.
 
-**Threading model:** Main thread runs pystray event loop. Audio capture runs in sounddevice callbacks. Hotkey transcriptions and daily transcription run in daemon threads. Whisper is loaded lazily and unloaded after each use.
+**Threading model:** Main thread runs pystray. `LatestJobRunner` owns quick work, `ExclusiveJobRunner` owns daily work, and `_whisper_inference_lock` protects model load/inference/unload.
 
 ## Key Dependencies
 
@@ -66,7 +80,7 @@ Audio devices → sounddevice callbacks → DailyAudioRecorder → mic.raw / sys
 
 ## Config
 
-`config.json` is auto-generated on first run. Important keys:
+`%LOCALAPPDATA%\Pascribe\config.json` is auto-generated on first run. Important keys:
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -75,8 +89,8 @@ Audio devices → sounddevice callbacks → DailyAudioRecorder → mic.raw / sys
 | `whisper_model` | `"large-v3"` | faster-whisper model |
 | `whisper_device` | `"cuda"` | `"cuda"` or `"cpu"` |
 | `daily_recording` | `false` | Enable disk recording |
-| `recording_path` | `"recordings"` | Where to store daily audio |
-| `assemblyai_key` | `""` | AssemblyAI API key |
+| `recording_path` | `%LOCALAPPDATA%\Pascribe\recordings` | Where to store daily audio |
+| `assemblyai_key` | `""` | In-memory API key; DPAPI-protected on disk |
 | `homelab_url` | `null` | HTTP endpoint for daily transcripts |
 | `delete_after_transcribe` | `false` | Delete raw audio after transcription |
 
@@ -96,4 +110,4 @@ Audio devices → sounddevice callbacks → DailyAudioRecorder → mic.raw / sys
 }
 ```
 
-Saved to `recordings/YYYY-MM-DD/transcript.json` and optionally POSTed to `homelab_url`.
+Saved under the configured recording directory as `YYYY-MM-DD/transcript.json` and optionally POSTed to `homelab_url`.

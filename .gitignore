@@ -2,6 +2,11 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+.pascribe-data/
+config.json
+history.json
+pascribe.log
+*.corrupt-*
 .env
 *.egg-info/
 dist/
