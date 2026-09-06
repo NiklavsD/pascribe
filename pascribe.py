@@ -715,7 +715,14 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
-def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict]:
+def transcribe_with_assemblyai(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    _urlopen=urllib.request.urlopen,
+    _sleep=time.sleep,
+    _monotonic=time.monotonic,
+) -> list[dict]:
     """Upload VAD-stripped audio to AssemblyAI, poll until done, return segments.
     Each segment: {start_s, end_s, text}.
     """
@@ -734,7 +741,7 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
         f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes, headers=hdrs_bin, method="POST"
     )
     try:
-        with urllib.request.urlopen(req) as r:
+        with _urlopen(req) as r:
             upload_url = json.loads(r.read())["upload_url"]
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -746,7 +753,7 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
         f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
     )
     try:
-        with urllib.request.urlopen(req) as r:
+        with _urlopen(req) as r:
             transcript_id = json.loads(r.read())["id"]
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -757,22 +764,40 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
     poll_url = f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}"
     timeout_s = max(1, int(config.get("assemblyai_poll_timeout_minutes", 30))) * 60
     max_retries = max(1, int(config.get("assemblyai_poll_retries", 3)))
-    deadline = time.monotonic() + timeout_s
+    deadline = _monotonic() + timeout_s
     network_errors = 0
     while True:
-        if time.monotonic() > deadline:
+        if _monotonic() > deadline:
             raise RuntimeError(
                 f"AssemblyAI job {transcript_id} did not complete within "
                 f"{timeout_s // 60} minutes — giving up"
             )
         req = urllib.request.Request(poll_url, headers={"authorization": api_key})
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with _urlopen(req, timeout=30) as r:
                 result = json.loads(r.read())
             network_errors = 0
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"AssemblyAI poll {e.code}: {body[:400]}")
+            if e.code not in {408, 425, 429, 500, 502, 503, 504}:
+                body = e.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"AssemblyAI poll {e.code}: {body[:400]}")
+            network_errors += 1
+            if network_errors >= max_retries:
+                raise RuntimeError(
+                    f"AssemblyAI poll failed after {network_errors} transient "
+                    f"HTTP {e.code} responses"
+                )
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            try:
+                backoff = min(60, max(1, int(retry_after)))
+            except (TypeError, ValueError):
+                backoff = 5 * network_errors
+            log.warning(
+                f"AssemblyAI poll HTTP {e.code} ({network_errors}/{max_retries}), "
+                f"retrying in {backoff}s"
+            )
+            _sleep(backoff)
+            continue
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             network_errors += 1
             if network_errors >= max_retries:
@@ -784,7 +809,7 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
                 f"AssemblyAI poll network error {network_errors}/{max_retries}, "
                 f"retrying in {backoff}s: {e}"
             )
-            time.sleep(backoff)
+            _sleep(backoff)
             continue
         status = result["status"]
         if status == "completed":
@@ -792,7 +817,7 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
         elif status == "error":
             raise RuntimeError(f"AssemblyAI error: {result.get('error', 'unknown')}")
         log.info(f"AssemblyAI: {status}...")
-        time.sleep(5)
+        _sleep(5)
 
     # 4. Group words into utterances by pause threshold
     words = result.get("words", [])
