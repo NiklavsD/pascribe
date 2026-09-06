@@ -86,6 +86,8 @@ DEFAULT_CONFIG = {
     "assemblyai_key": "",
     "homelab_url": None,
     "delete_after_transcribe": False,
+    "assemblyai_poll_timeout_minutes": 30,
+    "assemblyai_poll_retries": 3,
 }
 
 def load_config() -> dict:
@@ -751,16 +753,39 @@ def transcribe_with_assemblyai(audio: np.ndarray, sample_rate: int) -> list[dict
         raise RuntimeError(f"AssemblyAI submit {e.code}: {body[:400]}")
     log.info(f"AssemblyAI job: {transcript_id}")
 
-    # 3. Poll
+    # 3. Poll — with retry on transient network errors and an overall timeout
     poll_url = f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}"
+    timeout_s = max(1, int(config.get("assemblyai_poll_timeout_minutes", 30))) * 60
+    max_retries = max(1, int(config.get("assemblyai_poll_retries", 3)))
+    deadline = time.monotonic() + timeout_s
+    network_errors = 0
     while True:
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"AssemblyAI job {transcript_id} did not complete within "
+                f"{timeout_s // 60} minutes — giving up"
+            )
         req = urllib.request.Request(poll_url, headers={"authorization": api_key})
         try:
-            with urllib.request.urlopen(req) as r:
+            with urllib.request.urlopen(req, timeout=30) as r:
                 result = json.loads(r.read())
+            network_errors = 0
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"AssemblyAI poll {e.code}: {body[:400]}")
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            network_errors += 1
+            if network_errors >= max_retries:
+                raise RuntimeError(
+                    f"AssemblyAI poll failed after {network_errors} network errors: {e}"
+                )
+            backoff = 5 * network_errors
+            log.warning(
+                f"AssemblyAI poll network error {network_errors}/{max_retries}, "
+                f"retrying in {backoff}s: {e}"
+            )
+            time.sleep(backoff)
+            continue
         status = result["status"]
         if status == "completed":
             break
