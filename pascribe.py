@@ -13,6 +13,7 @@ import wave
 import logging
 import subprocess
 import errno
+import hashlib
 import http.client
 import socket
 import urllib.request
@@ -776,12 +777,22 @@ def _assemblyai_request_json(
     _sleep,
     retry_ambiguous: bool = True,
     recover_result=None,
+    deadline: float | None = None,
+    _monotonic=time.monotonic,
 ) -> dict:
     failures = 0
     while True:
+        attempt_timeout_s = timeout_s
+        if deadline is not None:
+            remaining_s = deadline - _monotonic()
+            if remaining_s <= 0:
+                raise RuntimeError(f"AssemblyAI {operation} deadline exceeded")
+            attempt_timeout_s = min(timeout_s, max(1, int(remaining_s)))
         try:
-            with _urlopen(req, timeout=timeout_s) as r:
-                return json.loads(r.read())
+            with _urlopen(req, timeout=attempt_timeout_s) as r:
+                return _assemblyai_read_json(
+                    r, deadline=deadline, _monotonic=_monotonic
+                )
         except urllib.error.HTTPError as e:
             if e.code not in ASSEMBLYAI_TRANSIENT_HTTP_CODES:
                 try:
@@ -823,6 +834,11 @@ def _assemblyai_request_json(
                 f"AssemblyAI {operation} failed after {failures} attempts: {detail}"
             ) from error
         backoff = _assemblyai_retry_delay(error, failures)
+        if deadline is not None and backoff >= deadline - _monotonic():
+            raise RuntimeError(
+                f"AssemblyAI {operation} cannot retry within its deadline "
+                f"(server requested {backoff}s)"
+            ) from error
         log.warning(
             f"AssemblyAI {operation} {detail} (retry {failures}/{max_retries}), "
             f"retrying in {backoff}s"
@@ -850,6 +866,8 @@ def _assemblyai_find_transcript(
     timeout_s: int,
     _urlopen,
     _sleep,
+    deadline: float | None = None,
+    _monotonic=time.monotonic,
 ) -> dict | bool | None:
     req = urllib.request.Request(
         f"{ASSEMBLYAI_BASE}/transcript?limit=100",
@@ -859,7 +877,8 @@ def _assemblyai_find_transcript(
         try:
             result = _assemblyai_request_json(
                 req, "transcript lookup", timeout_s=timeout_s, max_retries=1,
-                _urlopen=_urlopen, _sleep=_sleep,
+                _urlopen=_urlopen, _sleep=_sleep, deadline=deadline,
+                _monotonic=_monotonic,
             )
         except RuntimeError as e:
             log.warning(f"AssemblyAI existing-job check failed: {e}")
@@ -869,8 +888,52 @@ def _assemblyai_find_transcript(
                 log.info(f"Recovered existing AssemblyAI job: {transcript['id']}")
                 return {"id": transcript["id"]}
         if check < 2:
+            if deadline is not None and 2 >= deadline - _monotonic():
+                return None
             _sleep(2)
     return False
+
+
+def _assemblyai_pending_path() -> Path:
+    return (
+        Path(config.get("recording_path", "recordings"))
+        / ".assemblyai_pending_job.json"
+    )
+
+
+def _load_assemblyai_pending_job(audio_hash: str) -> str | None:
+    path = _assemblyai_pending_path()
+    try:
+        pending = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if pending.get("audio_hash") == audio_hash:
+        return pending.get("transcript_id")
+    return None
+
+
+def _save_assemblyai_pending_job(audio_hash: str, transcript_id: str):
+    path = _assemblyai_pending_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps({"audio_hash": audio_hash, "transcript_id": transcript_id}),
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, path)
+
+
+def _clear_assemblyai_pending_job(audio_hash: str, transcript_id: str):
+    path = _assemblyai_pending_path()
+    try:
+        pending = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            pending.get("audio_hash") == audio_hash
+            and pending.get("transcript_id") == transcript_id
+        ):
+            path.unlink(missing_ok=True)
+    except (OSError, json.JSONDecodeError):
+        pass
 
 
 def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -909,34 +972,45 @@ def transcribe_with_assemblyai(
     upload_timeout_s = (
         max(1, int(config.get("assemblyai_upload_timeout_minutes", 30))) * 60
     )
+    audio_hash = hashlib.sha256(wav_bytes).hexdigest()
+    transcript_id = _load_assemblyai_pending_job(audio_hash)
 
-    # 1. Upload
-    req = urllib.request.Request(
-        f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes, headers=hdrs_bin, method="POST"
-    )
-    upload_result = _assemblyai_request_json(
-        req, "upload", timeout_s=upload_timeout_s, max_retries=max_retries,
-        _urlopen=_urlopen, _sleep=_sleep,
-    )
-    upload_url = upload_result["upload_url"]
+    if transcript_id:
+        log.info(f"Resuming pending AssemblyAI job: {transcript_id}")
+    else:
+        # 1. Upload
+        req = urllib.request.Request(
+            f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes, headers=hdrs_bin, method="POST"
+        )
+        upload_deadline = _monotonic() + upload_timeout_s
+        upload_result = _assemblyai_request_json(
+            req, "upload", timeout_s=upload_timeout_s, max_retries=max_retries,
+            _urlopen=_urlopen, _sleep=_sleep, deadline=upload_deadline,
+            _monotonic=_monotonic,
+        )
+        upload_url = upload_result["upload_url"]
 
-    # 2. Submit transcription job
-    body = json.dumps({"audio_url": upload_url, "language_detection": True}).encode()
-    req = urllib.request.Request(
-        f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
-    )
-    # Retry documented transient responses, but check the unique upload URL
-    # before replaying a 5xx response so the same audio is not billed twice.
-    submit_result = _assemblyai_request_json(
-        req, "submit", timeout_s=request_timeout_s, max_retries=max_retries,
-        _urlopen=_urlopen, _sleep=_sleep, retry_ambiguous=False,
-        recover_result=lambda: _assemblyai_find_transcript(
-            upload_url, api_key, timeout_s=request_timeout_s,
-            _urlopen=_urlopen, _sleep=_sleep,
-        ),
-    )
-    transcript_id = submit_result["id"]
-    log.info(f"AssemblyAI job: {transcript_id}")
+        # 2. Submit transcription job
+        body = json.dumps({"audio_url": upload_url, "language_detection": True}).encode()
+        req = urllib.request.Request(
+            f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
+        )
+        submit_deadline = _monotonic() + request_timeout_s
+        # Retry documented transient responses, but check the unique upload URL
+        # before replaying a 5xx response so the same audio is not billed twice.
+        submit_result = _assemblyai_request_json(
+            req, "submit", timeout_s=request_timeout_s, max_retries=max_retries,
+            _urlopen=_urlopen, _sleep=_sleep, retry_ambiguous=False,
+            recover_result=lambda: _assemblyai_find_transcript(
+                upload_url, api_key, timeout_s=request_timeout_s,
+                _urlopen=_urlopen, _sleep=_sleep, deadline=submit_deadline,
+                _monotonic=_monotonic,
+            ),
+            deadline=submit_deadline, _monotonic=_monotonic,
+        )
+        transcript_id = submit_result["id"]
+        _save_assemblyai_pending_job(audio_hash, transcript_id)
+        log.info(f"AssemblyAI job: {transcript_id}")
 
     # 3. Poll — with retry on transient network errors and an overall timeout
     poll_url = f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}"
@@ -959,6 +1033,8 @@ def transcribe_with_assemblyai(
             network_errors = 0
         except urllib.error.HTTPError as e:
             if e.code not in ASSEMBLYAI_TRANSIENT_HTTP_CODES:
+                if e.code == 404:
+                    _clear_assemblyai_pending_job(audio_hash, transcript_id)
                 body = e.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"AssemblyAI poll {e.code}: {body[:400]}")
             network_errors += 1
@@ -969,7 +1045,7 @@ def transcribe_with_assemblyai(
                 )
             retry_after = e.headers.get("Retry-After") if e.headers else None
             try:
-                backoff = min(60, max(1, int(retry_after)))
+                backoff = max(1, int(retry_after))
             except (TypeError, ValueError):
                 backoff = 5 * network_errors
             log.warning(
@@ -997,8 +1073,10 @@ def transcribe_with_assemblyai(
             continue
         status = result["status"]
         if status == "completed":
+            _clear_assemblyai_pending_job(audio_hash, transcript_id)
             break
         elif status == "error":
+            _clear_assemblyai_pending_job(audio_hash, transcript_id)
             raise RuntimeError(f"AssemblyAI error: {result.get('error', 'unknown')}")
         log.info(f"AssemblyAI: {status}...")
         remaining_s = deadline - _monotonic()
