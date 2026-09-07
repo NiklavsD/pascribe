@@ -714,7 +714,12 @@ ASSEMBLYAI_TRANSIENT_ERRORS = (
 
 
 ASSEMBLYAI_SAFE_SUBMIT_ERRNOS = {
-    errno.EADDRNOTAVAIL, errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH,
+    getattr(errno, name)
+    for name in (
+        "EADDRNOTAVAIL", "ECONNREFUSED", "EHOSTDOWN", "EHOSTUNREACH",
+        "ENETDOWN", "ENETUNREACH", "ENONET",
+    )
+    if hasattr(errno, name)
 }
 
 
@@ -724,6 +729,31 @@ def _assemblyai_safe_to_retry_submission(error: Exception) -> bool:
         isinstance(reason, socket.gaierror)
         or (isinstance(reason, OSError) and reason.errno in ASSEMBLYAI_SAFE_SUBMIT_ERRNOS)
     )
+
+
+def _assemblyai_read_json(
+    response,
+    *,
+    deadline: float | None = None,
+    _monotonic=time.monotonic,
+) -> dict:
+    if deadline is None or not hasattr(response, "read1"):
+        data = response.read()
+        if deadline is not None and _monotonic() >= deadline:
+            raise TimeoutError("AssemblyAI response exceeded the polling deadline")
+        return json.loads(data)
+
+    chunks = []
+    while True:
+        if _monotonic() >= deadline:
+            raise TimeoutError("AssemblyAI response exceeded the polling deadline")
+        chunk = response.read1(64 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    if _monotonic() >= deadline:
+        raise TimeoutError("AssemblyAI response exceeded the polling deadline")
+    return json.loads(b"".join(chunks))
 
 
 def _assemblyai_retry_delay(error: Exception, failure_count: int) -> int:
@@ -874,7 +904,9 @@ def transcribe_with_assemblyai(
         try:
             remaining_s = max(1, int(deadline - _monotonic()))
             with _urlopen(req, timeout=min(30, remaining_s)) as r:
-                result = json.loads(r.read())
+                result = _assemblyai_read_json(
+                    r, deadline=deadline, _monotonic=_monotonic
+                )
             network_errors = 0
         except urllib.error.HTTPError as e:
             if e.code not in ASSEMBLYAI_TRANSIENT_HTTP_CODES:
