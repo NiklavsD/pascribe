@@ -830,6 +830,14 @@ def _assemblyai_request_json(
 
         failures += 1
         if failures > max_retries:
+            if (
+                recover_result
+                and isinstance(error, urllib.error.HTTPError)
+                and 500 <= error.code < 600
+            ):
+                recovered = recover_result()
+                if isinstance(recovered, dict):
+                    return recovered
             raise RuntimeError(
                 f"AssemblyAI {operation} failed after {failures} attempts: {detail}"
             ) from error
@@ -901,36 +909,42 @@ def _assemblyai_pending_path() -> Path:
     )
 
 
-def _load_assemblyai_pending_job(audio_hash: str) -> str | None:
+def _load_assemblyai_pending_job(
+    audio_hash: str, pending_key: str | None = None
+) -> dict | None:
     path = _assemblyai_pending_path()
     try:
         pending = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if pending.get("audio_hash") == audio_hash:
-        return pending.get("transcript_id")
+    if pending_key is not None and pending.get("pending_key") == pending_key:
+        return pending
+    if pending_key is None and pending.get("audio_hash") == audio_hash:
+        return pending
     return None
 
 
-def _save_assemblyai_pending_job(audio_hash: str, transcript_id: str):
+def _save_assemblyai_pending_job(
+    audio_hash: str,
+    transcript_id: str,
+    pending_context: dict | None = None,
+):
     path = _assemblyai_pending_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    pending = {"audio_hash": audio_hash, "transcript_id": transcript_id}
+    if pending_context is not None:
+        pending["pending_key"] = pending_context.get("pending_key")
+        pending["context"] = pending_context
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(
-        json.dumps({"audio_hash": audio_hash, "transcript_id": transcript_id}),
-        encoding="utf-8",
-    )
+    tmp_path.write_text(json.dumps(pending), encoding="utf-8")
     os.replace(tmp_path, path)
 
 
-def _clear_assemblyai_pending_job(audio_hash: str, transcript_id: str):
+def _clear_assemblyai_pending_job(transcript_id: str):
     path = _assemblyai_pending_path()
     try:
         pending = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            pending.get("audio_hash") == audio_hash
-            and pending.get("transcript_id") == transcript_id
-        ):
+        if pending.get("transcript_id") == transcript_id:
             path.unlink(missing_ok=True)
     except (OSError, json.JSONDecodeError):
         pass
@@ -954,6 +968,7 @@ def transcribe_with_assemblyai(
     _urlopen=urllib.request.urlopen,
     _sleep=time.sleep,
     _monotonic=time.monotonic,
+    pending_context: dict | None = None,
 ) -> list[dict]:
     """Upload VAD-stripped audio to AssemblyAI, poll until done, return segments.
     Each segment: {start_s, end_s, text}.
@@ -973,9 +988,13 @@ def transcribe_with_assemblyai(
         max(1, int(config.get("assemblyai_upload_timeout_minutes", 30))) * 60
     )
     audio_hash = hashlib.sha256(wav_bytes).hexdigest()
-    transcript_id = _load_assemblyai_pending_job(audio_hash)
+    pending_key = pending_context.get("pending_key") if pending_context else None
+    pending = _load_assemblyai_pending_job(audio_hash, pending_key)
+    transcript_id = pending.get("transcript_id") if pending else None
 
     if transcript_id:
+        if pending_context is not None and isinstance(pending.get("context"), dict):
+            pending_context.update(pending["context"])
         log.info(f"Resuming pending AssemblyAI job: {transcript_id}")
     else:
         # 1. Upload
@@ -1009,7 +1028,7 @@ def transcribe_with_assemblyai(
             deadline=submit_deadline, _monotonic=_monotonic,
         )
         transcript_id = submit_result["id"]
-        _save_assemblyai_pending_job(audio_hash, transcript_id)
+        _save_assemblyai_pending_job(audio_hash, transcript_id, pending_context)
         log.info(f"AssemblyAI job: {transcript_id}")
 
     # 3. Poll — with retry on transient network errors and an overall timeout
@@ -1034,7 +1053,7 @@ def transcribe_with_assemblyai(
         except urllib.error.HTTPError as e:
             if e.code not in ASSEMBLYAI_TRANSIENT_HTTP_CODES:
                 if e.code == 404:
-                    _clear_assemblyai_pending_job(audio_hash, transcript_id)
+                    _clear_assemblyai_pending_job(transcript_id)
                 body = e.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"AssemblyAI poll {e.code}: {body[:400]}")
             network_errors += 1
@@ -1073,10 +1092,10 @@ def transcribe_with_assemblyai(
             continue
         status = result["status"]
         if status == "completed":
-            _clear_assemblyai_pending_job(audio_hash, transcript_id)
+            _clear_assemblyai_pending_job(transcript_id)
             break
         elif status == "error":
-            _clear_assemblyai_pending_job(audio_hash, transcript_id)
+            _clear_assemblyai_pending_job(transcript_id)
             raise RuntimeError(f"AssemblyAI error: {result.get('error', 'unknown')}")
         log.info(f"AssemblyAI: {status}...")
         remaining_s = deadline - _monotonic()
@@ -1177,7 +1196,20 @@ def _daily_transcription_worker():
         api_key = config.get("assemblyai_key", "")
         if api_key:
             notify(f"Transcribing {total_speech_s / 60:.0f} min via AssemblyAI...")
-            raw_segs = transcribe_with_assemblyai(stripped, sample_rate)
+            pending_context = {
+                "pending_key": date.today().isoformat(),
+                "seg_map": seg_map,
+                "duration_s": duration_s,
+                "total_speech_s": total_speech_s,
+                "started": started.isoformat(),
+            }
+            raw_segs = transcribe_with_assemblyai(
+                stripped, sample_rate, pending_context=pending_context
+            )
+            seg_map = pending_context["seg_map"]
+            duration_s = pending_context["duration_s"]
+            total_speech_s = pending_context["total_speech_s"]
+            started = datetime.fromisoformat(pending_context["started"])
         else:
             notify(f"No API key — using local GPU ({total_speech_s / 60:.0f} min)...")
             local = transcribe_audio(stripped)
