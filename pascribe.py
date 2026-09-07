@@ -93,6 +93,7 @@ DEFAULT_CONFIG = {
     "assemblyai_poll_timeout_minutes": 30,
     "assemblyai_poll_retries": 3,
     "assemblyai_request_timeout_seconds": 120,
+    "assemblyai_submission_recovery_minutes": 10,
     "assemblyai_upload_timeout_minutes": 30,
 }
 
@@ -569,13 +570,15 @@ class DailyAudioRecorder:
             self._close()
 
 
-def load_todays_recordings() -> tuple[np.ndarray | None, np.ndarray | None, datetime | None, int]:
-    """Load today's mic and system audio from disk.
-    Returns (mic_audio, sys_audio, start_time, sample_rate).
+def load_todays_recordings(
+    recording_date: str | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, datetime | None, int]:
+    """Load one day's mic and system audio from disk.
+    Defaults to today and can resume a pending job from an earlier date.
     """
     rec_path = Path(config.get("recording_path", "recordings"))
-    today = date.today().isoformat()
-    day_dir = rec_path / today
+    recording_date = recording_date or date.today().isoformat()
+    day_dir = rec_path / recording_date
 
     if not day_dir.exists():
         return None, None, None, 16000
@@ -799,9 +802,20 @@ def _assemblyai_request_json(
                     body = e.read().decode("utf-8", errors="replace")
                 except http.client.IncompleteRead as read_error:
                     body = read_error.partial.decode("utf-8", errors="replace")
-                raise RuntimeError(f"AssemblyAI {operation} {e.code}: {body[:400]}")
+                raise RuntimeError(
+                    f"AssemblyAI {operation} {e.code}: {body[:400]}"
+                ) from e
             detail = f"HTTP {e.code}"
             error = e
+            if not retry_ambiguous and 500 <= e.code < 600:
+                recovered = recover_result() if recover_result else None
+                if isinstance(recovered, dict):
+                    return recovered
+                raise RuntimeError(
+                    f"AssemblyAI {operation} returned HTTP {e.code} and its "
+                    "submission state is unknown; keeping it pending to avoid "
+                    "a duplicate job"
+                ) from e
         except ASSEMBLYAI_TRANSIENT_ERRORS as e:
             detail = str(e) or type(e).__name__
             error = e
@@ -877,24 +891,29 @@ def _assemblyai_find_transcript(
     deadline: float | None = None,
     _monotonic=time.monotonic,
 ) -> dict | bool | None:
-    req = urllib.request.Request(
-        f"{ASSEMBLYAI_BASE}/transcript?limit=100",
-        headers={"authorization": api_key},
-    )
+    first_url = f"{ASSEMBLYAI_BASE}/transcript?limit=100"
     for check in range(3):
-        try:
-            result = _assemblyai_request_json(
-                req, "transcript lookup", timeout_s=timeout_s, max_retries=1,
-                _urlopen=_urlopen, _sleep=_sleep, deadline=deadline,
-                _monotonic=_monotonic,
+        page_url = first_url
+        seen_urls = set()
+        while page_url and page_url not in seen_urls:
+            seen_urls.add(page_url)
+            req = urllib.request.Request(
+                page_url, headers={"authorization": api_key}
             )
-        except RuntimeError as e:
-            log.warning(f"AssemblyAI existing-job check failed: {e}")
-            return None
-        for transcript in result.get("transcripts", []):
-            if transcript.get("audio_url") == audio_url and transcript.get("id"):
-                log.info(f"Recovered existing AssemblyAI job: {transcript['id']}")
-                return {"id": transcript["id"]}
+            try:
+                result = _assemblyai_request_json(
+                    req, "transcript lookup", timeout_s=timeout_s, max_retries=1,
+                    _urlopen=_urlopen, _sleep=_sleep, deadline=deadline,
+                    _monotonic=_monotonic,
+                )
+            except RuntimeError as e:
+                log.warning(f"AssemblyAI existing-job check failed: {e}")
+                return None
+            for transcript in result.get("transcripts", []):
+                if transcript.get("audio_url") == audio_url and transcript.get("id"):
+                    log.info(f"Recovered existing AssemblyAI job: {transcript['id']}")
+                    return {"id": transcript["id"]}
+            page_url = result.get("page_details", {}).get("prev_url")
         if check < 2:
             if deadline is not None and 2 >= deadline - _monotonic():
                 return None
@@ -909,6 +928,18 @@ def _assemblyai_pending_path() -> Path:
     )
 
 
+def _assemblyai_pending_recording_date() -> str | None:
+    """Return the recording date owned by the pending cloud job, if any."""
+    try:
+        pending = json.loads(_assemblyai_pending_path().read_text(encoding="utf-8"))
+        pending_key = pending.get("pending_key")
+        if date.fromisoformat(pending_key).isoformat() == pending_key:
+            return pending_key
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return None
+
+
 def _load_assemblyai_pending_job(
     audio_hash: str, pending_key: str | None = None
 ) -> dict | None:
@@ -917,6 +948,23 @@ def _load_assemblyai_pending_job(
         pending = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    current_api_key = config.get("assemblyai_key", "")
+    current_key_hash = (
+        hashlib.sha256(current_api_key.encode()).hexdigest()
+        if current_api_key else None
+    )
+    if (
+        pending.get("api_key_hash")
+        and current_key_hash
+        and pending["api_key_hash"] != current_key_hash
+    ):
+        log.info("AssemblyAI API key changed; uploading the pending recording again")
+        return {
+            "audio_hash": audio_hash,
+            "pending_key": pending.get("pending_key"),
+            "context": pending.get("context"),
+            "submission_state": "new_snapshot",
+        }
     if pending_key is not None and pending.get("pending_key") == pending_key:
         return pending
     if pending_key is None and pending.get("audio_hash") == audio_hash:
@@ -926,12 +974,27 @@ def _load_assemblyai_pending_job(
 
 def _save_assemblyai_pending_job(
     audio_hash: str,
-    transcript_id: str,
+    transcript_id: str | None,
     pending_context: dict | None = None,
+    *,
+    upload_url: str | None = None,
+    submission_state: str | None = None,
+    submission_started_at: float | None = None,
 ):
     path = _assemblyai_pending_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    pending = {"audio_hash": audio_hash, "transcript_id": transcript_id}
+    pending = {"audio_hash": audio_hash}
+    api_key = config.get("assemblyai_key", "")
+    if api_key:
+        pending["api_key_hash"] = hashlib.sha256(api_key.encode()).hexdigest()
+    if transcript_id:
+        pending["transcript_id"] = transcript_id
+    if upload_url:
+        pending["upload_url"] = upload_url
+    if submission_state:
+        pending["submission_state"] = submission_state
+    if submission_started_at is not None:
+        pending["submission_started_at"] = submission_started_at
     if pending_context is not None:
         pending["pending_key"] = pending_context.get("pending_key")
         pending["context"] = pending_context
@@ -948,6 +1011,74 @@ def _clear_assemblyai_pending_job(transcript_id: str):
             path.unlink(missing_ok=True)
     except (OSError, json.JSONDecodeError):
         pass
+
+
+def _clear_assemblyai_pending_recording(pending_key: str):
+    path = _assemblyai_pending_path()
+    try:
+        pending = json.loads(path.read_text(encoding="utf-8"))
+        if pending.get("pending_key") == pending_key:
+            path.unlink(missing_ok=True)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+def _replace_failed_assemblyai_job(
+    transcript_id: str, pending_context: dict | None
+):
+    """Keep the recording queued when AssemblyAI rejects a previously accepted job."""
+    _clear_assemblyai_pending_job(transcript_id)
+    if pending_context is not None:
+        replacement_context = dict(pending_context)
+        replacement_context.pop("transcript_id", None)
+        _save_assemblyai_pending_job(
+            "", None, replacement_context, submission_state="new_snapshot"
+        )
+
+
+def _finalize_raw_snapshot(
+    day_dir: Path,
+    recording_date: str,
+    expected_sizes: dict[str, int],
+    *,
+    delete: bool,
+) -> bool:
+    """Atomically verify a raw snapshot and optionally delete only that snapshot."""
+    recorder = daily_recorder
+
+    def finalize() -> bool:
+        active = recorder is not None and recorder._current_date == recording_date
+        if active:
+            for fh in (recorder._mic_fh, recorder._sys_fh):
+                if fh:
+                    fh.flush()
+
+        for name, expected_size in expected_sizes.items():
+            path = day_dir / name
+            current_size = path.stat().st_size if path.exists() else 0
+            if current_size != expected_size:
+                return False
+
+        if not delete:
+            return True
+
+        if active:
+            recorder._close()
+        try:
+            for name in expected_sizes:
+                (day_dir / name).unlink(missing_ok=True)
+            # Any later recording starts a new timeline at byte zero, so it
+            # needs a fresh timestamp origin rather than the deleted one's.
+            (day_dir / "meta.json").unlink(missing_ok=True)
+        finally:
+            if active:
+                recorder._rotate(recording_date)
+        return True
+
+    if recorder is not None:
+        with recorder._lock:
+            return finalize()
+    return finalize()
 
 
 def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -968,6 +1099,7 @@ def transcribe_with_assemblyai(
     _urlopen=urllib.request.urlopen,
     _sleep=time.sleep,
     _monotonic=time.monotonic,
+    _wall_time=time.time,
     pending_context: dict | None = None,
 ) -> list[dict]:
     """Upload VAD-stripped audio to AssemblyAI, poll until done, return segments.
@@ -990,45 +1122,124 @@ def transcribe_with_assemblyai(
     audio_hash = hashlib.sha256(wav_bytes).hexdigest()
     pending_key = pending_context.get("pending_key") if pending_context else None
     pending = _load_assemblyai_pending_job(audio_hash, pending_key)
+    if (
+        pending_context is not None
+        and pending
+        and pending.get("submission_state") != "new_snapshot"
+        and isinstance(pending.get("context"), dict)
+    ):
+        pending_context.update(pending["context"])
+
     transcript_id = pending.get("transcript_id") if pending else None
+    upload_url = pending.get("upload_url") if pending else None
 
     if transcript_id:
-        if pending_context is not None and isinstance(pending.get("context"), dict):
-            pending_context.update(pending["context"])
+        if pending_context is not None:
+            pending_context["transcript_id"] = transcript_id
         log.info(f"Resuming pending AssemblyAI job: {transcript_id}")
     else:
-        # 1. Upload
-        req = urllib.request.Request(
-            f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes, headers=hdrs_bin, method="POST"
-        )
-        upload_deadline = _monotonic() + upload_timeout_s
-        upload_result = _assemblyai_request_json(
-            req, "upload", timeout_s=upload_timeout_s, max_retries=max_retries,
-            _urlopen=_urlopen, _sleep=_sleep, deadline=upload_deadline,
-            _monotonic=_monotonic,
-        )
-        upload_url = upload_result["upload_url"]
-
-        # 2. Submit transcription job
-        body = json.dumps({"audio_url": upload_url, "language_detection": True}).encode()
-        req = urllib.request.Request(
-            f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
-        )
-        submit_deadline = _monotonic() + request_timeout_s
-        # Retry documented transient responses, but check the unique upload URL
-        # before replaying a 5xx response so the same audio is not billed twice.
-        submit_result = _assemblyai_request_json(
-            req, "submit", timeout_s=request_timeout_s, max_retries=max_retries,
-            _urlopen=_urlopen, _sleep=_sleep, retry_ambiguous=False,
-            recover_result=lambda: _assemblyai_find_transcript(
+        if upload_url and pending.get("submission_state") == "unknown":
+            lookup_deadline = _monotonic() + request_timeout_s
+            recovered = _assemblyai_find_transcript(
                 upload_url, api_key, timeout_s=request_timeout_s,
-                _urlopen=_urlopen, _sleep=_sleep, deadline=submit_deadline,
+                _urlopen=_urlopen, _sleep=_sleep, deadline=lookup_deadline,
                 _monotonic=_monotonic,
-            ),
-            deadline=submit_deadline, _monotonic=_monotonic,
+            )
+            if isinstance(recovered, dict):
+                transcript_id = recovered["id"]
+            elif recovered is None:
+                raise RuntimeError(
+                    "AssemblyAI could not check a previous uncertain submission; "
+                    "keeping it pending to avoid a duplicate job"
+                )
+            else:
+                unknown_since = pending.get("submission_started_at")
+                if unknown_since is None:
+                    try:
+                        unknown_since = _assemblyai_pending_path().stat().st_mtime
+                    except OSError:
+                        unknown_since = _wall_time()
+                recovery_grace_s = max(
+                    1,
+                    int(config.get("assemblyai_submission_recovery_minutes", 10)),
+                ) * 60
+                if _wall_time() - float(unknown_since) < recovery_grace_s:
+                    raise RuntimeError(
+                        "AssemblyAI could not yet find a previous uncertain submission; "
+                        "keeping it pending rather than creating a duplicate job"
+                    )
+                log.warning(
+                    "AssemblyAI found no matching job after the recovery grace period; "
+                    "retrying the saved upload"
+                )
+
+        if not transcript_id and not upload_url:
+            # 1. Upload
+            req = urllib.request.Request(
+                f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes,
+                headers=hdrs_bin, method="POST",
+            )
+            upload_deadline = _monotonic() + upload_timeout_s
+            upload_result = _assemblyai_request_json(
+                req, "upload", timeout_s=upload_timeout_s,
+                max_retries=max_retries, _urlopen=_urlopen, _sleep=_sleep,
+                deadline=upload_deadline, _monotonic=_monotonic,
+            )
+            upload_url = upload_result["upload_url"]
+            _save_assemblyai_pending_job(
+                audio_hash, None, pending_context, upload_url=upload_url,
+                submission_state="ready",
+            )
+
+        if not transcript_id:
+            # 2. Submit transcription job. Mark the request uncertain before it
+            # starts so a process exit cannot cause a blind duplicate submission.
+            _save_assemblyai_pending_job(
+                audio_hash, None, pending_context, upload_url=upload_url,
+                submission_state="unknown", submission_started_at=_wall_time(),
+            )
+            body = json.dumps({"audio_url": upload_url, "language_detection": True}).encode()
+            req = urllib.request.Request(
+                f"{ASSEMBLYAI_BASE}/transcript", data=body,
+                headers=hdrs_json, method="POST",
+            )
+            submit_deadline = _monotonic() + request_timeout_s
+            try:
+                submit_result = _assemblyai_request_json(
+                    req, "submit", timeout_s=request_timeout_s,
+                    max_retries=max_retries, _urlopen=_urlopen, _sleep=_sleep,
+                    retry_ambiguous=False,
+                    recover_result=lambda: _assemblyai_find_transcript(
+                        upload_url, api_key, timeout_s=request_timeout_s,
+                        _urlopen=_urlopen, _sleep=_sleep,
+                        deadline=_monotonic() + request_timeout_s,
+                        _monotonic=_monotonic,
+                    ),
+                    deadline=submit_deadline, _monotonic=_monotonic,
+                )
+            except RuntimeError as e:
+                cause = e.__cause__
+                safe_http_failure = (
+                    isinstance(cause, urllib.error.HTTPError)
+                    and 400 <= cause.code < 500
+                )
+                if safe_http_failure or (
+                    isinstance(cause, Exception)
+                    and _assemblyai_safe_to_retry_submission(cause)
+                ):
+                    _save_assemblyai_pending_job(
+                        audio_hash, None, pending_context, upload_url=upload_url,
+                        submission_state="ready",
+                    )
+                raise
+            transcript_id = submit_result["id"]
+
+        if pending_context is not None:
+            pending_context["transcript_id"] = transcript_id
+        _save_assemblyai_pending_job(
+            audio_hash, transcript_id, pending_context, upload_url=upload_url,
+            submission_state="accepted",
         )
-        transcript_id = submit_result["id"]
-        _save_assemblyai_pending_job(audio_hash, transcript_id, pending_context)
         log.info(f"AssemblyAI job: {transcript_id}")
 
     # 3. Poll — with retry on transient network errors and an overall timeout
@@ -1053,7 +1264,7 @@ def transcribe_with_assemblyai(
         except urllib.error.HTTPError as e:
             if e.code not in ASSEMBLYAI_TRANSIENT_HTTP_CODES:
                 if e.code == 404:
-                    _clear_assemblyai_pending_job(transcript_id)
+                    _replace_failed_assemblyai_job(transcript_id, pending_context)
                 body = e.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"AssemblyAI poll {e.code}: {body[:400]}")
             network_errors += 1
@@ -1092,10 +1303,11 @@ def transcribe_with_assemblyai(
             continue
         status = result["status"]
         if status == "completed":
-            _clear_assemblyai_pending_job(transcript_id)
+            if pending_context is None:
+                _clear_assemblyai_pending_job(transcript_id)
             break
         elif status == "error":
-            _clear_assemblyai_pending_job(transcript_id)
+            _replace_failed_assemblyai_job(transcript_id, pending_context)
             raise RuntimeError(f"AssemblyAI error: {result.get('error', 'unknown')}")
         log.info(f"AssemblyAI: {status}...")
         remaining_s = deadline - _monotonic()
@@ -1148,9 +1360,33 @@ def run_daily_transcription():
 def _daily_transcription_worker():
     try:
         update_tray_icon("yellow")
-        notify("Loading today's recordings...")
+        notify("Loading recordings...")
 
-        mic_audio, sys_audio, started, sample_rate = load_todays_recordings()
+        api_key = config.get("assemblyai_key", "")
+        pending_recording_date = (
+            _assemblyai_pending_recording_date() if api_key else None
+        )
+        today = date.today().isoformat()
+        recording_date = pending_recording_date or today
+        mic_audio, sys_audio, started, sample_rate = load_todays_recordings(
+            recording_date
+        )
+
+        if (
+            mic_audio is None
+            and sys_audio is None
+            and pending_recording_date is not None
+        ):
+            log.warning(
+                f"Discarding pending AssemblyAI state for missing recording "
+                f"{pending_recording_date}"
+            )
+            _clear_assemblyai_pending_recording(pending_recording_date)
+            if recording_date != today:
+                recording_date = today
+                mic_audio, sys_audio, started, sample_rate = load_todays_recordings(
+                    recording_date
+                )
 
         if mic_audio is None and sys_audio is None:
             notify("No recordings found — enable Daily Recording in Settings")
@@ -1160,12 +1396,25 @@ def _daily_transcription_worker():
         has_both = mic_audio is not None and sys_audio is not None
 
         if has_both:
-            min_len = min(len(mic_audio), len(sys_audio))
-            mix = mic_audio[:min_len] * 0.5 + sys_audio[:min_len] * 0.5
+            max_len = max(len(mic_audio), len(sys_audio))
+            mix = np.zeros(max_len, dtype=np.float32)
+            channels = np.zeros(max_len, dtype=np.float32)
+            mix[:len(mic_audio)] += mic_audio
+            channels[:len(mic_audio)] += 1
+            mix[:len(sys_audio)] += sys_audio
+            channels[:len(sys_audio)] += 1
+            mix /= np.maximum(channels, 1)
         else:
             mix = mic_audio if mic_audio is not None else sys_audio
 
         duration_s = len(mix) / sample_rate
+        day_dir = Path(config.get("recording_path", "recordings")) / recording_date
+        with open(day_dir / "meta.json") as f:
+            raw_dtype = np.dtype(json.load(f).get("dtype", "float32"))
+        expected_raw_sizes = {
+            "mic.raw": len(mic_audio) * raw_dtype.itemsize if mic_audio is not None else 0,
+            "sys.raw": len(sys_audio) * raw_dtype.itemsize if sys_audio is not None else 0,
+        }
         log.info(f"Daily audio: {duration_s / 3600:.1f}h from {started.strftime('%H:%M')}")
 
         # VAD pre-strip to cut API costs
@@ -1193,16 +1442,20 @@ def _daily_transcription_worker():
         seg_map = _build_segment_map(vad_segs)
 
         # Transcribe via AssemblyAI (or fall back to local GPU)
-        api_key = config.get("assemblyai_key", "")
+        snapshot_has_newer_audio = False
+        current_snapshot_context = None
         if api_key:
             notify(f"Transcribing {total_speech_s / 60:.0f} min via AssemblyAI...")
-            pending_context = {
-                "pending_key": date.today().isoformat(),
+            current_snapshot_context = {
+                "pending_key": recording_date,
                 "seg_map": seg_map,
                 "duration_s": duration_s,
                 "total_speech_s": total_speech_s,
                 "started": started.isoformat(),
+                "raw_sizes": expected_raw_sizes,
             }
+            pending_context = dict(current_snapshot_context)
+            current_duration_s = duration_s
             raw_segs = transcribe_with_assemblyai(
                 stripped, sample_rate, pending_context=pending_context
             )
@@ -1210,12 +1463,33 @@ def _daily_transcription_worker():
             duration_s = pending_context["duration_s"]
             total_speech_s = pending_context["total_speech_s"]
             started = datetime.fromisoformat(pending_context["started"])
+            submitted_raw_sizes = pending_context.get("raw_sizes")
+            snapshot_has_newer_audio = (
+                duration_s < current_duration_s
+                or (
+                    isinstance(submitted_raw_sizes, dict)
+                    and submitted_raw_sizes != expected_raw_sizes
+                )
+            )
         else:
             notify(f"No API key — using local GPU ({total_speech_s / 60:.0f} min)...")
             local = transcribe_audio(stripped)
             raw_segs = [{"start_s": s, "end_s": e, "text": t} for s, e, t in local]
 
         if not raw_segs:
+            if api_key:
+                snapshot_has_newer_audio = snapshot_has_newer_audio or not (
+                    _finalize_raw_snapshot(
+                        day_dir, recording_date, expected_raw_sizes, delete=False
+                    )
+                )
+                _clear_assemblyai_pending_job(pending_context["transcript_id"])
+                if snapshot_has_newer_audio:
+                    _save_assemblyai_pending_job(
+                        "", None, current_snapshot_context,
+                        submission_state="new_snapshot",
+                    )
+                    notify("Newer audio remains and can be transcribed in a second run")
             notify("No speech transcribed")
             update_tray_icon("green")
             return
@@ -1243,7 +1517,7 @@ def _daily_transcription_worker():
         log.info(f"Daily transcript: {word_count} words, {len(raw_segs)} segments")
 
         payload = {
-            "date": date.today().isoformat(),
+            "date": recording_date,
             "recorded_from": started.isoformat(),
             "duration_minutes": round(duration_s / 60, 1),
             "speech_minutes": round(total_speech_s / 60, 1),
@@ -1255,13 +1529,10 @@ def _daily_transcription_worker():
         }
 
         # Save local copy alongside the raw audio
-        rec_path = Path(config.get("recording_path", "recordings"))
-        day_dir = rec_path / date.today().isoformat()
         out_path = day_dir / "transcript.json"
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
         log.info(f"Transcript saved: {out_path}")
-
         # POST to homelab if configured
         homelab_url = config.get("homelab_url")
         if homelab_url:
@@ -1272,13 +1543,32 @@ def _daily_transcription_worker():
                 log.error(f"Homelab POST failed: {e}")
                 notify(f"Homelab error: {e}")
 
-        # Optionally delete raw audio after successful transcription
-        if config.get("delete_after_transcribe"):
-            for name in ("mic.raw", "sys.raw"):
-                p = day_dir / name
-                if p.exists():
-                    p.unlink()
+        # Verify the on-disk files after cloud processing. The recorder may
+        # have appended audio while upload/polling was in progress.
+        delete_snapshot = (
+            bool(config.get("delete_after_transcribe"))
+            and not snapshot_has_newer_audio
+        )
+        snapshot_unchanged = _finalize_raw_snapshot(
+            day_dir, recording_date, expected_raw_sizes, delete=delete_snapshot
+        )
+        snapshot_has_newer_audio = snapshot_has_newer_audio or not snapshot_unchanged
+
+        if api_key:
+            _clear_assemblyai_pending_job(pending_context["transcript_id"])
+            if snapshot_has_newer_audio:
+                _save_assemblyai_pending_job(
+                    "", None, current_snapshot_context,
+                    submission_state="new_snapshot",
+                )
+                notify("Newer audio remains and can be transcribed in a second run")
+        else:
+            _clear_assemblyai_pending_recording(recording_date)
+
+        if delete_snapshot and snapshot_unchanged:
             log.info("Raw audio deleted after transcription")
+        elif config.get("delete_after_transcribe"):
+            log.info("Keeping raw audio recorded after the resumed snapshot")
 
         notify(f"Done — {word_count} words, {total_speech_s / 60:.0f} min of speech")
         update_tray_icon("green")
