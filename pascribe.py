@@ -90,6 +90,7 @@ DEFAULT_CONFIG = {
     "assemblyai_poll_timeout_minutes": 30,
     "assemblyai_poll_retries": 3,
     "assemblyai_request_timeout_seconds": 120,
+    "assemblyai_upload_timeout_minutes": 30,
 }
 
 def load_config() -> dict:
@@ -728,6 +729,7 @@ def _assemblyai_request_json(
     max_retries: int,
     _urlopen,
     _sleep,
+    retry_ambiguous: bool = True,
 ) -> dict:
     failures = 0
     while True:
@@ -746,9 +748,19 @@ def _assemblyai_request_json(
         except ASSEMBLYAI_TRANSIENT_ERRORS as e:
             detail = str(e) or type(e).__name__
             error = e
+            if not retry_ambiguous:
+                raise RuntimeError(
+                    f"AssemblyAI {operation} response failed and its submission "
+                    f"state is unknown; not retrying to avoid a duplicate job: {detail}"
+                ) from e
         except json.JSONDecodeError as e:
             detail = "invalid JSON response"
             error = e
+            if not retry_ambiguous:
+                raise RuntimeError(
+                    f"AssemblyAI {operation} returned an invalid response and its "
+                    "submission state is unknown; not retrying to avoid a duplicate job"
+                ) from e
 
         failures += 1
         if failures > max_retries:
@@ -796,13 +808,16 @@ def transcribe_with_assemblyai(
     hdrs_bin  = {"authorization": api_key, "content-type": "application/octet-stream"}
     max_retries = max(0, int(config.get("assemblyai_poll_retries", 3)))
     request_timeout_s = max(1, int(config.get("assemblyai_request_timeout_seconds", 120)))
+    upload_timeout_s = (
+        max(1, int(config.get("assemblyai_upload_timeout_minutes", 30))) * 60
+    )
 
     # 1. Upload
     req = urllib.request.Request(
         f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes, headers=hdrs_bin, method="POST"
     )
     upload_result = _assemblyai_request_json(
-        req, "upload", timeout_s=request_timeout_s, max_retries=max_retries,
+        req, "upload", timeout_s=upload_timeout_s, max_retries=max_retries,
         _urlopen=_urlopen, _sleep=_sleep,
     )
     upload_url = upload_result["upload_url"]
@@ -814,7 +829,7 @@ def transcribe_with_assemblyai(
     )
     submit_result = _assemblyai_request_json(
         req, "submit", timeout_s=request_timeout_s, max_retries=max_retries,
-        _urlopen=_urlopen, _sleep=_sleep,
+        _urlopen=_urlopen, _sleep=_sleep, retry_ambiguous=False,
     )
     transcript_id = submit_result["id"]
     log.info(f"AssemblyAI job: {transcript_id}")
