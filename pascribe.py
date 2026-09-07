@@ -12,6 +12,7 @@ import json
 import wave
 import logging
 import subprocess
+import http.client
 import urllib.request
 import urllib.error
 from collections import deque
@@ -88,6 +89,7 @@ DEFAULT_CONFIG = {
     "delete_after_transcribe": False,
     "assemblyai_poll_timeout_minutes": 30,
     "assemblyai_poll_retries": 3,
+    "assemblyai_request_timeout_seconds": 120,
 }
 
 def load_config() -> dict:
@@ -702,6 +704,63 @@ def _assign_speaker(start_s: float, end_s: float,
 # ─── AssemblyAI ───────────────────────────────────────────────────────────────
 
 ASSEMBLYAI_BASE = "https://api.assemblyai.com/v2"
+ASSEMBLYAI_TRANSIENT_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
+ASSEMBLYAI_TRANSIENT_ERRORS = (
+    urllib.error.URLError, OSError, TimeoutError, http.client.IncompleteRead,
+)
+
+
+def _assemblyai_retry_delay(error: Exception, failure_count: int) -> int:
+    if isinstance(error, urllib.error.HTTPError):
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        try:
+            return min(60, max(1, int(retry_after)))
+        except (TypeError, ValueError):
+            pass
+    return min(60, 5 * failure_count)
+
+
+def _assemblyai_request_json(
+    req: urllib.request.Request,
+    operation: str,
+    *,
+    timeout_s: int,
+    max_retries: int,
+    _urlopen,
+    _sleep,
+) -> dict:
+    failures = 0
+    while True:
+        try:
+            with _urlopen(req, timeout=timeout_s) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code not in ASSEMBLYAI_TRANSIENT_HTTP_CODES:
+                try:
+                    body = e.read().decode("utf-8", errors="replace")
+                except http.client.IncompleteRead as read_error:
+                    body = read_error.partial.decode("utf-8", errors="replace")
+                raise RuntimeError(f"AssemblyAI {operation} {e.code}: {body[:400]}")
+            detail = f"HTTP {e.code}"
+            error = e
+        except ASSEMBLYAI_TRANSIENT_ERRORS as e:
+            detail = str(e) or type(e).__name__
+            error = e
+        except json.JSONDecodeError as e:
+            detail = "invalid JSON response"
+            error = e
+
+        failures += 1
+        if failures > max_retries:
+            raise RuntimeError(
+                f"AssemblyAI {operation} failed after {failures} attempts: {detail}"
+            ) from error
+        backoff = _assemblyai_retry_delay(error, failures)
+        log.warning(
+            f"AssemblyAI {operation} {detail} (retry {failures}/{max_retries}), "
+            f"retrying in {backoff}s"
+        )
+        _sleep(backoff)
 
 
 def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -735,35 +794,34 @@ def transcribe_with_assemblyai(
 
     hdrs_json = {"authorization": api_key, "content-type": "application/json"}
     hdrs_bin  = {"authorization": api_key, "content-type": "application/octet-stream"}
+    max_retries = max(0, int(config.get("assemblyai_poll_retries", 3)))
+    request_timeout_s = max(1, int(config.get("assemblyai_request_timeout_seconds", 120)))
 
     # 1. Upload
     req = urllib.request.Request(
         f"{ASSEMBLYAI_BASE}/upload", data=wav_bytes, headers=hdrs_bin, method="POST"
     )
-    try:
-        with _urlopen(req) as r:
-            upload_url = json.loads(r.read())["upload_url"]
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"AssemblyAI upload {e.code}: {body[:400]}")
+    upload_result = _assemblyai_request_json(
+        req, "upload", timeout_s=request_timeout_s, max_retries=max_retries,
+        _urlopen=_urlopen, _sleep=_sleep,
+    )
+    upload_url = upload_result["upload_url"]
 
     # 2. Submit transcription job
     body = json.dumps({"audio_url": upload_url, "language_detection": True}).encode()
     req = urllib.request.Request(
         f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
     )
-    try:
-        with _urlopen(req) as r:
-            transcript_id = json.loads(r.read())["id"]
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"AssemblyAI submit {e.code}: {body[:400]}")
+    submit_result = _assemblyai_request_json(
+        req, "submit", timeout_s=request_timeout_s, max_retries=max_retries,
+        _urlopen=_urlopen, _sleep=_sleep,
+    )
+    transcript_id = submit_result["id"]
     log.info(f"AssemblyAI job: {transcript_id}")
 
     # 3. Poll — with retry on transient network errors and an overall timeout
     poll_url = f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}"
     timeout_s = max(1, int(config.get("assemblyai_poll_timeout_minutes", 30))) * 60
-    max_retries = max(1, int(config.get("assemblyai_poll_retries", 3)))
     deadline = _monotonic() + timeout_s
     network_errors = 0
     while True:
@@ -774,15 +832,16 @@ def transcribe_with_assemblyai(
             )
         req = urllib.request.Request(poll_url, headers={"authorization": api_key})
         try:
-            with _urlopen(req, timeout=30) as r:
+            remaining_s = max(1, int(deadline - _monotonic()))
+            with _urlopen(req, timeout=min(30, remaining_s)) as r:
                 result = json.loads(r.read())
             network_errors = 0
         except urllib.error.HTTPError as e:
-            if e.code not in {408, 425, 429, 500, 502, 503, 504}:
+            if e.code not in ASSEMBLYAI_TRANSIENT_HTTP_CODES:
                 body = e.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"AssemblyAI poll {e.code}: {body[:400]}")
             network_errors += 1
-            if network_errors >= max_retries:
+            if network_errors > max_retries:
                 raise RuntimeError(
                     f"AssemblyAI poll failed after {network_errors} transient "
                     f"HTTP {e.code} responses"
@@ -793,20 +852,20 @@ def transcribe_with_assemblyai(
             except (TypeError, ValueError):
                 backoff = 5 * network_errors
             log.warning(
-                f"AssemblyAI poll HTTP {e.code} ({network_errors}/{max_retries}), "
+                f"AssemblyAI poll HTTP {e.code} (retry {network_errors}/{max_retries}), "
                 f"retrying in {backoff}s"
             )
             _sleep(backoff)
             continue
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+        except (*ASSEMBLYAI_TRANSIENT_ERRORS, json.JSONDecodeError) as e:
             network_errors += 1
-            if network_errors >= max_retries:
+            if network_errors > max_retries:
                 raise RuntimeError(
                     f"AssemblyAI poll failed after {network_errors} network errors: {e}"
                 )
             backoff = 5 * network_errors
             log.warning(
-                f"AssemblyAI poll network error {network_errors}/{max_retries}, "
+                f"AssemblyAI poll network error (retry {network_errors}/{max_retries}), "
                 f"retrying in {backoff}s: {e}"
             )
             _sleep(backoff)
