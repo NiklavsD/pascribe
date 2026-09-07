@@ -775,7 +775,6 @@ def _assemblyai_request_json(
     _urlopen,
     _sleep,
     retry_ambiguous: bool = True,
-    retry_http_codes: set[int] | None = None,
 ) -> dict:
     failures = 0
     while True:
@@ -789,11 +788,6 @@ def _assemblyai_request_json(
                 except http.client.IncompleteRead as read_error:
                     body = read_error.partial.decode("utf-8", errors="replace")
                 raise RuntimeError(f"AssemblyAI {operation} {e.code}: {body[:400]}")
-            if retry_http_codes is not None and e.code not in retry_http_codes:
-                raise RuntimeError(
-                    f"AssemblyAI {operation} returned HTTP {e.code}; not retrying "
-                    "to avoid a duplicate job"
-                ) from e
             detail = f"HTTP {e.code}"
             error = e
         except ASSEMBLYAI_TRANSIENT_ERRORS as e:
@@ -881,10 +875,11 @@ def transcribe_with_assemblyai(
     req = urllib.request.Request(
         f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
     )
+    # AssemblyAI recommends retrying explicit transient HTTP responses.
+    # Interrupted/invalid responses remain ambiguous and are not replayed.
     submit_result = _assemblyai_request_json(
         req, "submit", timeout_s=request_timeout_s, max_retries=max_retries,
         _urlopen=_urlopen, _sleep=_sleep, retry_ambiguous=False,
-        retry_http_codes={425, 429},
     )
     transcript_id = submit_result["id"]
     log.info(f"AssemblyAI job: {transcript_id}")
