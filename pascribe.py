@@ -12,7 +12,9 @@ import json
 import wave
 import logging
 import subprocess
+import errno
 import http.client
+import socket
 import urllib.request
 import urllib.error
 from collections import deque
@@ -711,6 +713,19 @@ ASSEMBLYAI_TRANSIENT_ERRORS = (
 )
 
 
+ASSEMBLYAI_SAFE_SUBMIT_ERRNOS = {
+    errno.EADDRNOTAVAIL, errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH,
+}
+
+
+def _assemblyai_safe_to_retry_submission(error: Exception) -> bool:
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    return (
+        isinstance(reason, socket.gaierror)
+        or (isinstance(reason, OSError) and reason.errno in ASSEMBLYAI_SAFE_SUBMIT_ERRNOS)
+    )
+
+
 def _assemblyai_retry_delay(error: Exception, failure_count: int) -> int:
     if isinstance(error, urllib.error.HTTPError):
         retry_after = error.headers.get("Retry-After") if error.headers else None
@@ -730,6 +745,7 @@ def _assemblyai_request_json(
     _urlopen,
     _sleep,
     retry_ambiguous: bool = True,
+    retry_http_codes: set[int] | None = None,
 ) -> dict:
     failures = 0
     while True:
@@ -743,12 +759,20 @@ def _assemblyai_request_json(
                 except http.client.IncompleteRead as read_error:
                     body = read_error.partial.decode("utf-8", errors="replace")
                 raise RuntimeError(f"AssemblyAI {operation} {e.code}: {body[:400]}")
+            if retry_http_codes is not None and e.code not in retry_http_codes:
+                raise RuntimeError(
+                    f"AssemblyAI {operation} returned HTTP {e.code}; not retrying "
+                    "to avoid a duplicate job"
+                ) from e
             detail = f"HTTP {e.code}"
             error = e
         except ASSEMBLYAI_TRANSIENT_ERRORS as e:
             detail = str(e) or type(e).__name__
             error = e
-            if not retry_ambiguous:
+            if (
+                not retry_ambiguous
+                and not _assemblyai_safe_to_retry_submission(e)
+            ):
                 raise RuntimeError(
                     f"AssemblyAI {operation} response failed and its submission "
                     f"state is unknown; not retrying to avoid a duplicate job: {detail}"
@@ -830,6 +854,7 @@ def transcribe_with_assemblyai(
     submit_result = _assemblyai_request_json(
         req, "submit", timeout_s=request_timeout_s, max_retries=max_retries,
         _urlopen=_urlopen, _sleep=_sleep, retry_ambiguous=False,
+        retry_http_codes={425, 429},
     )
     transcript_id = submit_result["id"]
     log.info(f"AssemblyAI job: {transcript_id}")
@@ -840,7 +865,7 @@ def transcribe_with_assemblyai(
     deadline = _monotonic() + timeout_s
     network_errors = 0
     while True:
-        if _monotonic() > deadline:
+        if _monotonic() >= deadline:
             raise RuntimeError(
                 f"AssemblyAI job {transcript_id} did not complete within "
                 f"{timeout_s // 60} minutes — giving up"
@@ -870,7 +895,9 @@ def transcribe_with_assemblyai(
                 f"AssemblyAI poll HTTP {e.code} (retry {network_errors}/{max_retries}), "
                 f"retrying in {backoff}s"
             )
-            _sleep(backoff)
+            remaining_s = deadline - _monotonic()
+            if remaining_s > 0:
+                _sleep(min(backoff, remaining_s))
             continue
         except (*ASSEMBLYAI_TRANSIENT_ERRORS, json.JSONDecodeError) as e:
             network_errors += 1
@@ -883,7 +910,9 @@ def transcribe_with_assemblyai(
                 f"AssemblyAI poll network error (retry {network_errors}/{max_retries}), "
                 f"retrying in {backoff}s: {e}"
             )
-            _sleep(backoff)
+            remaining_s = deadline - _monotonic()
+            if remaining_s > 0:
+                _sleep(min(backoff, remaining_s))
             continue
         status = result["status"]
         if status == "completed":
@@ -891,7 +920,9 @@ def transcribe_with_assemblyai(
         elif status == "error":
             raise RuntimeError(f"AssemblyAI error: {result.get('error', 'unknown')}")
         log.info(f"AssemblyAI: {status}...")
-        _sleep(5)
+        remaining_s = deadline - _monotonic()
+        if remaining_s > 0:
+            _sleep(min(5, remaining_s))
 
     # 4. Group words into utterances by pause threshold
     words = result.get("words", [])
