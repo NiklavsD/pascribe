@@ -760,7 +760,7 @@ def _assemblyai_retry_delay(error: Exception, failure_count: int) -> int:
     if isinstance(error, urllib.error.HTTPError):
         retry_after = error.headers.get("Retry-After") if error.headers else None
         try:
-            return min(60, max(1, int(retry_after)))
+            return max(1, int(retry_after))
         except (TypeError, ValueError):
             pass
     return min(60, 5 * failure_count)
@@ -775,6 +775,7 @@ def _assemblyai_request_json(
     _urlopen,
     _sleep,
     retry_ambiguous: bool = True,
+    recover_result=None,
 ) -> dict:
     failures = 0
     while True:
@@ -797,6 +798,9 @@ def _assemblyai_request_json(
                 not retry_ambiguous
                 and not _assemblyai_safe_to_retry_submission(e)
             ):
+                recovered = recover_result() if recover_result else None
+                if isinstance(recovered, dict):
+                    return recovered
                 raise RuntimeError(
                     f"AssemblyAI {operation} response failed and its submission "
                     f"state is unknown; not retrying to avoid a duplicate job: {detail}"
@@ -805,6 +809,9 @@ def _assemblyai_request_json(
             detail = "invalid JSON response"
             error = e
             if not retry_ambiguous:
+                recovered = recover_result() if recover_result else None
+                if isinstance(recovered, dict):
+                    return recovered
                 raise RuntimeError(
                     f"AssemblyAI {operation} returned an invalid response and its "
                     "submission state is unknown; not retrying to avoid a duplicate job"
@@ -821,6 +828,49 @@ def _assemblyai_request_json(
             f"retrying in {backoff}s"
         )
         _sleep(backoff)
+        if (
+            recover_result
+            and isinstance(error, urllib.error.HTTPError)
+            and 500 <= error.code < 600
+        ):
+            recovered = recover_result()
+            if isinstance(recovered, dict):
+                return recovered
+            if recovered is None:
+                raise RuntimeError(
+                    f"AssemblyAI {operation} returned HTTP {error.code}, and the "
+                    "existing-job check failed; not retrying to avoid a duplicate job"
+                ) from error
+
+
+def _assemblyai_find_transcript(
+    audio_url: str,
+    api_key: str,
+    *,
+    timeout_s: int,
+    _urlopen,
+    _sleep,
+) -> dict | bool | None:
+    req = urllib.request.Request(
+        f"{ASSEMBLYAI_BASE}/transcript?limit=100",
+        headers={"authorization": api_key},
+    )
+    for check in range(3):
+        try:
+            result = _assemblyai_request_json(
+                req, "transcript lookup", timeout_s=timeout_s, max_retries=1,
+                _urlopen=_urlopen, _sleep=_sleep,
+            )
+        except RuntimeError as e:
+            log.warning(f"AssemblyAI existing-job check failed: {e}")
+            return None
+        for transcript in result.get("transcripts", []):
+            if transcript.get("audio_url") == audio_url and transcript.get("id"):
+                log.info(f"Recovered existing AssemblyAI job: {transcript['id']}")
+                return {"id": transcript["id"]}
+        if check < 2:
+            _sleep(2)
+    return False
 
 
 def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -875,11 +925,15 @@ def transcribe_with_assemblyai(
     req = urllib.request.Request(
         f"{ASSEMBLYAI_BASE}/transcript", data=body, headers=hdrs_json, method="POST"
     )
-    # AssemblyAI recommends retrying explicit transient HTTP responses.
-    # Interrupted/invalid responses remain ambiguous and are not replayed.
+    # Retry documented transient responses, but check the unique upload URL
+    # before replaying a 5xx response so the same audio is not billed twice.
     submit_result = _assemblyai_request_json(
         req, "submit", timeout_s=request_timeout_s, max_retries=max_retries,
         _urlopen=_urlopen, _sleep=_sleep, retry_ambiguous=False,
+        recover_result=lambda: _assemblyai_find_transcript(
+            upload_url, api_key, timeout_s=request_timeout_s,
+            _urlopen=_urlopen, _sleep=_sleep,
+        ),
     )
     transcript_id = submit_result["id"]
     log.info(f"AssemblyAI job: {transcript_id}")
