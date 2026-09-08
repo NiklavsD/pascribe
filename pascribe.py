@@ -354,25 +354,63 @@ WHISPER_VRAM_MB = {
 }
 VRAM_SAFETY_MARGIN_MB = 512
 
-def _check_vram(model_name: str) -> tuple[bool, str]:
-    """Check if enough VRAM is available to load the model. Returns (ok, reason)."""
+_vram_check_warned = False
+
+
+def _free_vram_mb() -> float | None:
+    """Return free GPU memory in MB, or None if it can't be determined.
+
+    Uses the CUDA runtime (installed by install.bat) via ctypes, falling back
+    to nvidia-smi. Does not require torch.
+    """
     try:
-        import torch
-        if not torch.cuda.is_available():
-            return True, ""  # CPU mode, no VRAM concern
-        free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
-        needed_mb = WHISPER_VRAM_MB.get(model_name, 3200) + VRAM_SAFETY_MARGIN_MB
-        if free_mb < needed_mb:
-            return False, (
-                f"Not enough VRAM: {free_mb:.0f} MB free, "
-                f"~{needed_mb:.0f} MB needed for {model_name}"
+        import ctypes
+        cudart = ctypes.WinDLL("cudart64_12.dll")
+        free = ctypes.c_size_t()
+        total = ctypes.c_size_t()
+        if cudart.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total)) == 0:
+            return free.value / (1024 * 1024)
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return float(out.stdout.strip().splitlines()[0])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _check_vram(model_name: str) -> tuple[bool, str]:
+    """Check if enough VRAM is available to load the model. Returns (ok, reason).
+
+    If the check itself can't run, logs once and allows the load attempt.
+    """
+    global _vram_check_warned
+    needed_mb = WHISPER_VRAM_MB.get(model_name, 3200) + VRAM_SAFETY_MARGIN_MB
+    free_mb = _free_vram_mb()
+    if free_mb is None:
+        if not _vram_check_warned:
+            _vram_check_warned = True
+            log.warning(
+                "Could not determine free VRAM (cudart/nvidia-smi unavailable) — "
+                "skipping the pre-load VRAM check"
             )
         return True, ""
-    except ImportError:
-        return True, ""  # No torch = likely CPU mode
-    except Exception as e:
-        log.warning(f"VRAM check failed: {e}")
-        return True, ""  # Don't block on check failure
+    if free_mb < needed_mb:
+        return False, (
+            f"Not enough VRAM: {free_mb:.0f} MB free, "
+            f"~{needed_mb:.0f} MB needed for {model_name}. "
+            "Try a smaller model in Settings, or switch Whisper device to CPU."
+        )
+    return True, ""
 
 def init_whisper():
     """Initialize faster-whisper model (lazy load on first use)."""
@@ -937,6 +975,12 @@ def _daily_transcription_worker():
         notify(f"Done — {word_count} words, {total_speech_s / 60:.0f} min of speech")
         update_tray_icon("green")
 
+    except RuntimeError as e:
+        # Model load refused (e.g. not enough VRAM) — readable message, no traceback
+        log.error(f"Daily transcription skipped: {e}")
+        notify(f"Daily transcription skipped: {e}")
+        update_tray_icon("red")
+        threading.Timer(3, lambda: update_tray_icon("green")).start()
     except Exception as e:
         log.error(f"Daily transcription failed: {e}", exc_info=True)
         notify(f"Daily transcription failed: {e}")
