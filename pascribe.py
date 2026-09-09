@@ -410,6 +410,10 @@ def unload_whisper():
         pass  # native CUDA cleanup can segfault — don't let it kill us
     log.info("Whisper model unloaded")
 
+# Audio must be at most this many seconds for a hallucination-phrase match to
+# be discarded; Whisper hallucinations only occur on (near-)silent audio.
+MIN_HALLUCINATION_DURATION = 1.5
+
 WHISPER_HALLUCINATIONS = {
     "thank you", "thanks for watching", "thanks for listening",
     "subscribe", "like and subscribe", "bye", "goodbye",
@@ -440,13 +444,20 @@ def transcribe_audio(
             result.append((segment.start, segment.end, text))
 
     # Filter hallucinations: if the entire transcription is just a known
-    # hallucination phrase, discard it
+    # hallucination phrase AND the corresponding audio is trivially short,
+    # discard it. Real speech that happens to be one of these generic words
+    # (e.g. a long "goodbye") is kept.
     if result:
         all_text = " ".join(t for _, _, t in result).strip().lower()
         all_text = all_text.strip(".,!?")
         if all_text in WHISPER_HALLUCINATIONS:
-            log.info(f"Filtered hallucination: '{all_text}'")
-            return []
+            duration = sum(end - start for start, end, _ in result)
+            if duration <= MIN_HALLUCINATION_DURATION:
+                log.info(f"Filtered hallucination: '{all_text}' "
+                         f"(audio duration {duration:.1f}s)")
+                return []
+            log.info(f"Kept '{all_text}' despite matching hallucination list "
+                     f"(audio duration {duration:.1f}s looks like real speech)")
 
     return result
 
