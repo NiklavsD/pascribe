@@ -3,6 +3,7 @@ Pascribe Server — Receives transcripts and triggers analysis via OpenClaw.
 Public at talk.benbox.dev via Cloudflare tunnel.
 """
 
+import hmac
 import json
 import os
 from datetime import datetime, timezone
@@ -14,7 +15,7 @@ app = Flask(__name__)
 TRANSCRIPTS_DIR = Path(__file__).parent / "transcripts"
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 
-# Simple token in URL path (no auth header needed from client)
+# Secret is only accepted via the Authorization header, never the URL
 API_TOKEN = os.environ.get("PASCRIBE_TOKEN", "8f338b6c289a4b9898a221bfa3081c64")
 
 
@@ -28,7 +29,7 @@ def receive_transcript():
     """
     Receive a transcript. Accepts both JSON and plain text.
     
-    Auth: Bearer token in header OR ?token= query param.
+    Auth: Bearer token in the Authorization header.
     
     JSON format:
     {
@@ -100,15 +101,11 @@ def receive_transcript():
 
 
 def _check_auth():
-    """Accept Bearer header OR ?token= query param."""
-    # Query param
-    if request.args.get("token") == API_TOKEN:
-        return True
-    # Bearer header
+    """Accept only a Bearer token in the Authorization header."""
     auth = request.headers.get("Authorization", "")
-    if auth == f"Bearer {API_TOKEN}" or auth == API_TOKEN:
-        return True
-    return False
+    if auth == API_TOKEN:
+        return hmac.compare_digest(auth, API_TOKEN)
+    return hmac.compare_digest(auth, f"Bearer {API_TOKEN}")
 
 
 if __name__ == "__main__":
