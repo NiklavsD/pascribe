@@ -15,7 +15,12 @@ TRANSCRIPTS_DIR = Path(__file__).parent / "transcripts"
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 
 # Simple token in URL path (no auth header needed from client)
-API_TOKEN = os.environ.get("PASCRIBE_TOKEN", "8f338b6c289a4b9898a221bfa3081c64")
+API_TOKEN = os.environ.get("PASCRIBE_TOKEN", "").strip()
+if not API_TOKEN:
+    raise SystemExit(
+        "PASCRIBE_TOKEN environment variable is not set; refusing to start. "
+        "Set it (e.g. in the service environment) before launching the server."
+    )
 
 
 @app.route("/health", methods=["GET"])
