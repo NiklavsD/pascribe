@@ -1027,9 +1027,8 @@ async def on_message(message: discord.Message):
             await message.channel.send(f"⚠️ duplex error: {e}")
         return
 
-    from config import VC_TRIGGER_ENABLED as _VC_ON
-    if not _VC_ON:
-        return
+    # TTS of bot responses is independent of VC_TRIGGER_ENABLED (which gates
+    # only the wake-word trigger cascade).
     if not TTS_ENABLED:
         return
     if message.channel.id != REPORT_CHANNEL_ID:
