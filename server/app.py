@@ -14,8 +14,14 @@ app = Flask(__name__)
 TRANSCRIPTS_DIR = Path(__file__).parent / "transcripts"
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 
-# Simple token in URL path (no auth header needed from client)
-API_TOKEN = os.environ.get("PASCRIBE_TOKEN", "8f338b6c289a4b9898a221bfa3081c64")
+# Simple token check (no auth header needed from client).
+# No fallback: without PASCRIBE_TOKEN the server must never accept uploads.
+API_TOKEN = os.environ.get("PASCRIBE_TOKEN", "")
+if not API_TOKEN:
+    raise RuntimeError(
+        "PASCRIBE_TOKEN is not set. Refusing to start without an upload secret. "
+        "Set PASCRIBE_TOKEN to a strong random value."
+    )
 
 
 @app.route("/health", methods=["GET"])
