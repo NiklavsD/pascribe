@@ -51,7 +51,23 @@ async def upload_file(filepath: Path) -> str:
 
 
 async def transcribe(audio_url: str) -> dict:
-    """Submit a transcription job and poll until complete. Returns the transcript object."""
+    """Submit a transcription job and poll until complete. Returns the transcript object.
+
+    Some clips make AssemblyAI fail with "Internal server error" every time
+    auto_chapters is on (seen on a 21s clip from 2026-09-04: 5/5 failures
+    with chapters, clean transcript without). Retry once without chapters so
+    one such clip doesn't block its whole discussion from being marked done.
+    """
+    try:
+        return await _transcribe_once(audio_url, auto_chapters=True)
+    except RuntimeError as e:
+        if "Internal server error" not in str(e):
+            raise
+        log.warning("Retrying %s without auto_chapters after server error", audio_url)
+        return await _transcribe_once(audio_url, auto_chapters=False)
+
+
+async def _transcribe_once(audio_url: str, auto_chapters: bool) -> dict:
     async with aiohttp.ClientSession() as session:
         # Submit
         payload = {
@@ -64,7 +80,7 @@ async def transcribe(audio_url: str) -> dict:
             # Used downstream by idea-gen prepare_inputs.py to chunk by topic
             # instead of arbitrary 80K-char windows. (Mutually exclusive with
             # `summarization`, which is why we don't enable both.)
-            "auto_chapters": True,
+            "auto_chapters": auto_chapters,
         }
         async with session.post(
             f"{BASE_URL}/transcript",

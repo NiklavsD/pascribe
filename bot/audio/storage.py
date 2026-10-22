@@ -147,6 +147,10 @@ def get_all_speech_segments_chronological(date: datetime | None = None) -> list[
             continue
         username = user_dir.name
         for f in user_dir.glob("*_speech*.wav"):
+            # _merged_* are the pipeline's temp concatenations; a crash
+            # mid-run leaves them behind and they'd be re-sent as duplicates.
+            if f.name.startswith("_"):
+                continue
             segments.append((username, f))
 
     # Sort by filename (which starts with HHMMSS_microseconds)
