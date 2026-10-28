@@ -97,8 +97,9 @@ def verify(wav: Path, opus: Path) -> tuple[bool, str, float]:
 def convert(wav: Path, delete: bool) -> tuple[str, Path, int, int, float, str]:
     """Returns (status, wav, wav_bytes, opus_bytes, seconds, detail)."""
     opus = wav.with_suffix(".opus")
-    wav_bytes = wav.stat().st_size
+    wav_bytes = 0
     try:
+        wav_bytes = wav.stat().st_size
         if not opus.exists():
             tmp = opus.with_name(opus.name + ".part")
             try:
@@ -132,8 +133,11 @@ def find_wavs(root: Path, days: list[str] | None, min_age_s: float) -> list[Path
         if days and day_dir.name not in days:
             continue
         for wav in sorted(day_dir.glob("*/*.wav")):
-            if wav.stat().st_mtime < cutoff:
-                out.append(wav)
+            try:
+                if wav.stat().st_mtime < cutoff:
+                    out.append(wav)
+            except FileNotFoundError:  # a pipeline temp file that just went away
+                continue
     return out
 
 
@@ -151,7 +155,7 @@ def main() -> int:
 
     root = a.root.resolve()
     wavs = find_wavs(root, a.days, a.min_age)
-    total_bytes = sum(w.stat().st_size for w in wavs)
+    total_bytes = sum(w.stat().st_size for w in wavs if w.exists())
     print(f"{len(wavs)} WAVs, {total_bytes / 1e9:.1f} GB under {root}; "
           f"{'deleting' if a.delete else 'keeping'} verified WAVs; manifest {a.manifest}", flush=True)
 
