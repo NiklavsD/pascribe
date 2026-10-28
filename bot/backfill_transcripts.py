@@ -15,11 +15,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from audio.storage import get_new_speech_segments, mark_files_processed, load_speaker_ids
+from audio.storage import (
+    MIN_TRANSCRIBE_S,
+    audio_seconds,
+    get_new_speech_segments,
+    load_speaker_ids,
+    mark_files_processed,
+)
 from config import RECORDINGS_DIR
 from transcription.assemblyai import transcribe_file
 from transcription.pipeline import (
@@ -30,7 +35,6 @@ from transcription.pipeline import (
 )
 
 log = logging.getLogger("backfill")
-MIN_BYTES = 10_000  # same cutoff as the live pipeline
 CONCURRENCY = 5
 
 
@@ -38,16 +42,8 @@ class FatalAPIError(RuntimeError):
     pass
 
 
-def _wav_seconds(path: Path) -> float:
-    try:
-        with wave.open(str(path), "rb") as w:
-            return w.getnframes() / float(w.getframerate())
-    except Exception:
-        return 0.0
-
-
 async def _transcribe(sem: asyncio.Semaphore, username: str, path: Path) -> dict | None:
-    if path.stat().st_size < MIN_BYTES:
+    if audio_seconds(path) < MIN_TRANSCRIBE_S:  # same cutoff as the live pipeline
         return None
     async with sem:
         for attempt in range(3):
@@ -84,7 +80,7 @@ async def backfill_day(day: datetime, dry_run: bool, send: bool) -> tuple[int, i
         log.info("%s: nothing pending", day_str)
         return 0, 0, 0.0
     discussions = _split_into_discussions(segs)
-    secs = sum(_wav_seconds(p) for _, p in segs if p.stat().st_size >= MIN_BYTES)
+    secs = sum(s for s in (audio_seconds(p) for _, p in segs) if s >= MIN_TRANSCRIBE_S)
     log.info("%s: %d segments, %d discussions, %.1f min of audio", day_str, len(segs), len(discussions), secs / 60)
     if dry_run:
         return len(discussions), 0, secs
