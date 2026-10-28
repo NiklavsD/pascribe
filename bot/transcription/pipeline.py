@@ -15,8 +15,10 @@ from audio.storage import (
     get_new_speech_segments,
     get_all_speech_segments_chronological,
     mark_files_processed,
-    concatenate_wav_files,
+    concatenate_audio_files,
     load_speaker_ids,
+    audio_seconds,
+    MIN_TRANSCRIBE_S,
 )
 from config import PASCRIBE_URL, PASCRIBE_TOKEN, DISCUSSION_GAP_S
 from transcription.assemblyai import transcribe_file
@@ -73,7 +75,7 @@ async def send_to_pascribe(payload: dict) -> dict:
 
 
 def _seconds_from_filename(filename: str) -> float:
-    """Extract seconds since midnight from a filename like '020345_440505_speech.wav'."""
+    """Extract seconds since midnight from a filename like '020345_440505_speech.opus'."""
     parts = filename.split("_")
     if len(parts) >= 1 and len(parts[0]) == 6:
         t = parts[0]
@@ -112,9 +114,10 @@ def _split_into_discussions(segments: list[tuple[str, Path]]) -> list[list[tuple
 
 async def _transcribe_single_segment(username: str, filepath: Path) -> dict | None:
     """Transcribe a single speech segment. Returns dict or None if empty."""
-    # Skip very small files (< 10KB likely no real speech)
-    if filepath.stat().st_size < 10_000:
-        log.debug("Skipping tiny segment %s (%d bytes)", filepath.name, filepath.stat().st_size)
+    # Skip near-empty segments (< 0.1 s, no real speech)
+    seconds = audio_seconds(filepath)
+    if seconds < MIN_TRANSCRIBE_S:
+        log.debug("Skipping tiny segment %s (%.2fs)", filepath.name, seconds)
         return None
 
     try:
@@ -165,10 +168,10 @@ def _merge_consecutive_segments(segments: list[tuple[str, Path]]) -> list[tuple[
                 merged.append((current_user, current_files[0]))
             else:
                 # Concatenate multiple files
-                combined = concatenate_wav_files(current_files)
+                combined = concatenate_audio_files(current_files)
                 if combined:
                     # Rename to indicate it's merged
-                    merged_path = combined.parent / f"_merged_{current_files[0].name}"
+                    merged_path = combined.parent / f"_merged_{current_files[0].stem}{combined.suffix}"
                     combined.rename(merged_path)
                     merged.append((current_user, merged_path))
                 else:
@@ -182,9 +185,9 @@ def _merge_consecutive_segments(segments: list[tuple[str, Path]]) -> list[tuple[
     if len(current_files) == 1:
         merged.append((current_user, current_files[0]))
     else:
-        combined = concatenate_wav_files(current_files)
+        combined = concatenate_audio_files(current_files)
         if combined:
-            merged_path = combined.parent / f"_merged_{current_files[0].name}"
+            merged_path = combined.parent / f"_merged_{current_files[0].stem}{combined.suffix}"
             combined.rename(merged_path)
             merged.append((current_user, merged_path))
         else:
@@ -202,8 +205,9 @@ async def transcribe_segments_individually(segments: list[tuple[str, Path]]) -> 
     Merges consecutive same-user segments into single API calls to reduce cost,
     while keeping different-user segments separate for correct attribution.
     """
-    # Step 1: Merge consecutive same-user segments
-    merged = _merge_consecutive_segments(segments)
+    # Step 1: Merge consecutive same-user segments (decodes via ffmpeg, so
+    # keep it off the event loop)
+    merged = await asyncio.to_thread(_merge_consecutive_segments, segments)
     
     # Step 2: Transcribe merged segments in parallel batches
     results = []
